@@ -20,22 +20,50 @@ export type JobItemPreview = {
   newCompareAtPrice: number | null;
 };
 
+export type AdvancedFilter = {
+  combinator: "AND" | "OR";
+  tags: string[];
+  vendors: string[];
+  productTypes: string[];
+  collectionIds: string[];
+};
+
+function escapeQueryValue(value: string): string {
+  return value.replace(/'/g, "");
+}
+
 function searchQueryForFilter(filterType: JobFilterType, filterValue: string): string {
   switch (filterType) {
     case "collection":
       return `collection_id:${filterValue}`;
     case "tag":
-      return `tag:'${filterValue.replace(/'/g, "")}'`;
+      return `tag:'${escapeQueryValue(filterValue)}'`;
     case "vendor":
-      return `vendor:'${filterValue.replace(/'/g, "")}'`;
+      return `vendor:'${escapeQueryValue(filterValue)}'`;
     case "productType":
-      return `product_type:'${filterValue.replace(/'/g, "")}'`;
+      return `product_type:'${escapeQueryValue(filterValue)}'`;
     default:
       throw new Error(`searchQueryForFilter does not support filterType ${filterType}`);
   }
 }
 
-/** Resolves the variant set for a non-CSV job (collection/tag/vendor/productType/manual). */
+function searchQueryForAdvancedFilter(filterValue: string): string {
+  const filter: AdvancedFilter = JSON.parse(filterValue);
+  const clauses = [
+    ...filter.tags.map((t) => `tag:'${escapeQueryValue(t)}'`),
+    ...filter.vendors.map((v) => `vendor:'${escapeQueryValue(v)}'`),
+    ...filter.productTypes.map((p) => `product_type:'${escapeQueryValue(p)}'`),
+    ...filter.collectionIds.map((c) => `collection_id:${c}`),
+  ];
+
+  if (clauses.length === 0) {
+    throw new Error("Add at least one tag, vendor, product type, or collection to filter by.");
+  }
+
+  return clauses.join(filter.combinator === "AND" ? " AND " : " OR ");
+}
+
+/** Resolves the variant set for a non-CSV job (collection/tag/vendor/productType/advanced/manual). */
 export async function resolveJobVariants(
   admin: AdminGraphqlClient,
   filterType: JobFilterType,
@@ -47,6 +75,9 @@ export async function resolveJobVariants(
   }
   if (filterType === "csv") {
     throw new Error("CSV jobs build their item list directly, not via resolveJobVariants");
+  }
+  if (filterType === "advanced") {
+    return resolveVariantsByQuery(admin, searchQueryForAdvancedFilter(filterValue));
   }
   return resolveVariantsByQuery(admin, searchQueryForFilter(filterType, filterValue));
 }

@@ -60,6 +60,7 @@ enum JobFilterType {
   tag
   vendor
   productType
+  advanced
   manual
   csv
 }

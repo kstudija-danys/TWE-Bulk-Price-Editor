@@ -81,11 +81,13 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
 };
 
 const FILTER_OPTIONS = [
-  { label: "Collection (ID)", value: "collection" },
-  { label: "Tag", value: "tag" },
-  { label: "Vendor", value: "vendor" },
-  { label: "Product type", value: "productType" },
-  { label: "Manual (variant GIDs, comma separated)", value: "manual" },
+  { label: "Filter by tag / vendor / product type / collection", value: "advanced" },
+  { label: "Manual product selection", value: "manual" },
+];
+
+const COMBINATOR_OPTIONS = [
+  { label: "ANY of these (OR)", value: "OR" },
+  { label: "ALL of these (AND)", value: "AND" },
 ];
 
 const MODE_OPTIONS = [
@@ -106,8 +108,13 @@ export default function NewJob() {
   const shopify = useAppBridge();
 
   const [name, setName] = useState("");
-  const [filterType, setFilterType] = useState("collection");
-  const [filterValue, setFilterValue] = useState("");
+  const [filterType, setFilterType] = useState("advanced");
+  const [combinator, setCombinator] = useState<"AND" | "OR">("OR");
+  const [tagsInput, setTagsInput] = useState("");
+  const [vendorsInput, setVendorsInput] = useState("");
+  const [productTypesInput, setProductTypesInput] = useState("");
+  const [collections, setCollections] = useState<{ id: string; title: string }[]>([]);
+  const [manualFilterValue, setManualFilterValue] = useState("");
   const [mode, setMode] = useState("percent");
   const [targetField, setTargetField] = useState("price");
   const [value, setValue] = useState("");
@@ -123,7 +130,7 @@ export default function NewJob() {
     navigate(`/app/jobs/${fetcher.data.jobId}`);
   }
 
-  async function pickProducts() {
+  async function pickProductVariants() {
     const selection = await shopify.resourcePicker({
       type: "product",
       multiple: true,
@@ -136,13 +143,61 @@ export default function NewJob() {
         if (variant.id) variantIds.push(variant.id);
       }
     }
-    setFilterType("manual");
-    setFilterValue(JSON.stringify(variantIds));
+    setManualFilterValue(JSON.stringify(variantIds));
   }
+
+  async function pickCollections() {
+    const selection = await shopify.resourcePicker({
+      type: "collection",
+      multiple: true,
+      action: "select",
+    });
+    if (!selection) return;
+    setCollections(
+      selection.map((c) => ({ id: c.id, title: c.title ?? c.id })),
+    );
+  }
+
+  function splitList(input: string): string[] {
+    return input
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  function buildFilterValue(): string {
+    if (filterType === "manual") return manualFilterValue;
+    return JSON.stringify({
+      combinator,
+      tags: splitList(tagsInput),
+      vendors: splitList(vendorsInput),
+      productTypes: splitList(productTypesInput),
+      collectionIds: collections.map((c) => c.id),
+    });
+  }
+
+  const advancedCriteriaCount =
+    splitList(tagsInput).length +
+    splitList(vendorsInput).length +
+    splitList(productTypesInput).length +
+    collections.length;
+
+  const canSubmit =
+    filterType === "manual" ? Boolean(manualFilterValue) : advancedCriteriaCount > 0;
 
   function submit(intent: "preview" | "create") {
     fetcher.submit(
-      { intent, name, mode, targetField, value, filterType, filterValue, runAt, revertAt },
+      {
+        intent,
+        name,
+        mode,
+        targetField,
+        value,
+        filterType,
+        filterValue: buildFilterValue(),
+        runAt,
+        revertAt,
+      },
       { method: "POST" },
     );
   }
@@ -168,18 +223,51 @@ export default function NewJob() {
             />
             {filterType === "manual" ? (
               <BlockStack gap="200">
-                <Button onClick={pickProducts}>Pick products</Button>
+                <Button onClick={pickProductVariants}>Pick products</Button>
                 <Text as="span" tone="subdued">
-                  {filterValue ? `${JSON.parse(filterValue).length} variant(s) selected` : "No products selected"}
+                  {manualFilterValue
+                    ? `${JSON.parse(manualFilterValue).length} variant(s) selected`
+                    : "No products selected"}
                 </Text>
               </BlockStack>
             ) : (
-              <TextField
-                label={FILTER_OPTIONS.find((o) => o.value === filterType)?.label ?? "Value"}
-                value={filterValue}
-                onChange={setFilterValue}
-                autoComplete="off"
-              />
+              <BlockStack gap="300">
+                {advancedCriteriaCount > 1 && (
+                  <Select
+                    label="Combine criteria"
+                    options={COMBINATOR_OPTIONS}
+                    value={combinator}
+                    onChange={(v) => setCombinator(v as "AND" | "OR")}
+                  />
+                )}
+                <TextField
+                  label="Tags (comma separated)"
+                  placeholder="sale, clearance"
+                  value={tagsInput}
+                  onChange={setTagsInput}
+                  autoComplete="off"
+                />
+                <TextField
+                  label="Vendors (comma separated)"
+                  value={vendorsInput}
+                  onChange={setVendorsInput}
+                  autoComplete="off"
+                />
+                <TextField
+                  label="Product types (comma separated)"
+                  value={productTypesInput}
+                  onChange={setProductTypesInput}
+                  autoComplete="off"
+                />
+                <BlockStack gap="200">
+                  <Button onClick={pickCollections}>Pick collections</Button>
+                  <Text as="span" tone="subdued">
+                    {collections.length
+                      ? collections.map((c) => c.title).join(", ")
+                      : "No collections selected"}
+                  </Text>
+                </BlockStack>
+              </BlockStack>
             )}
 
             <Select label="Rule" options={MODE_OPTIONS} value={mode} onChange={setMode} />
@@ -226,14 +314,14 @@ export default function NewJob() {
             />
 
             <InlineStack gap="300">
-              <Button onClick={() => submit("preview")} loading={isLoading} disabled={!filterValue || !value}>
+              <Button onClick={() => submit("preview")} loading={isLoading} disabled={!canSubmit || !value}>
                 Preview
               </Button>
               <Button
                 variant="primary"
                 onClick={() => submit("create")}
                 loading={isLoading}
-                disabled={!filterValue || !value}
+                disabled={!canSubmit || !value}
               >
                 {runAt ? "Schedule price change" : "Apply price change"}
               </Button>

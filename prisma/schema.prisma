@@ -1,0 +1,111 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
+// enough when changing adapters.
+// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String    @db.Text
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?   @db.Text
+  refreshTokenExpires DateTime?
+}
+
+enum JobStatus {
+  draft
+  scheduled
+  running
+  completed
+  reverted
+  failed
+}
+
+enum JobMode {
+  percent
+  fixed
+  setvalue
+  csv
+}
+
+enum JobTargetField {
+  price
+  compareAtPrice
+  both
+}
+
+enum JobFilterType {
+  collection
+  tag
+  vendor
+  productType
+  manual
+  csv
+}
+
+enum JobItemStatus {
+  pending
+  applied
+  reverted
+  error
+}
+
+model PriceJob {
+  id           String         @id @default(cuid())
+  shopName     String
+  status       JobStatus      @default(draft)
+  mode         JobMode
+  targetField  JobTargetField
+  value        Decimal?       @db.Decimal(12, 4)
+  filterType   JobFilterType
+  filterValue  String?        @db.Text
+  runAt        DateTime?
+  revertAt     DateTime?
+  errorMessage String?        @db.Text
+  createdAt    DateTime       @default(now())
+  completedAt  DateTime?
+  revertedAt   DateTime?
+  items        PriceJobItem[]
+
+  @@index([shopName, status])
+  @@index([status, runAt])
+}
+
+model PriceJobItem {
+  id                String        @id @default(cuid())
+  jobId             String
+  job               PriceJob      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  variantId         String
+  productId         String
+  sku               String?
+  oldPrice          Decimal       @db.Decimal(12, 4)
+  newPrice          Decimal       @db.Decimal(12, 4)
+  oldCompareAtPrice Decimal?      @db.Decimal(12, 4)
+  newCompareAtPrice Decimal?      @db.Decimal(12, 4)
+  status            JobItemStatus @default(pending)
+  errorMessage      String?       @db.Text
+
+  @@index([jobId])
+  @@index([variantId])
+}

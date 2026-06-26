@@ -13,7 +13,7 @@
     "worker": "node --import tsx worker/index.ts",
     "docker-start": "npm run setup && npm run start",
     "docker-start-worker": "npm run setup && npm run worker",
-    "setup": "prisma generate && prisma migrate deploy",
+    "setup": "prisma generate && prisma db push",
     "lint": "eslint --cache --cache-location ./node_modules/.cache/eslint .",
     "shopify": "shopify",
     "prisma": "prisma",

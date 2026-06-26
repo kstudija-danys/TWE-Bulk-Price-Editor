@@ -19,7 +19,9 @@ one-click revert.
    `SHOPIFY_API_SECRET`, `SHOPIFY_APP_URL`, and `DATABASE_URL` (your MySQL
    connection string).
 2. `npm install`
-3. `npx prisma migrate dev` (first run: creates the schema in your DB)
+3. `npx prisma db push` (first run: creates the schema in your DB — the
+   shared-hosting MySQL user typically can't create a shadow database, so
+   this project uses `db push` instead of `migrate dev`/`migrate deploy`)
 4. `npm run dev` — runs the Shopify CLI dev tunnel + Remix app
 5. In a second terminal: `npm run worker` — runs the scheduler/reverter loop
    against the same database

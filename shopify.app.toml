@@ -1,6 +1,6 @@
 # This file stores configurations for your Shopify app.
 
-client_id = ""
+client_id = "2b2556a262e7acc14b0d3c6169062189"
 name = "bulk-price-editor"
 
 [access_scopes]

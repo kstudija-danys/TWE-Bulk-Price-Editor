@@ -74,6 +74,7 @@ enum JobItemStatus {
 model PriceJob {
   id           String         @id @default(cuid())
   shopName     String
+  name         String?
   status       JobStatus      @default(draft)
   mode         JobMode
   targetField  JobTargetField

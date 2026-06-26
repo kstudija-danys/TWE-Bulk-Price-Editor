@@ -32,6 +32,7 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
   const formData = await request.formData();
 
   const intent = formData.get("intent") as "preview" | "create";
+  const name = formData.get("name") as string;
   const mode = formData.get("mode") as JobMode;
   const targetField = formData.get("targetField") as JobTargetField;
   const value = Number(formData.get("value"));
@@ -57,6 +58,7 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
 
     const job = await createJob({
       shopName: session.shop,
+      name,
       mode,
       targetField,
       value,
@@ -103,6 +105,7 @@ export default function NewJob() {
   const navigate = useNavigate();
   const shopify = useAppBridge();
 
+  const [name, setName] = useState("");
   const [filterType, setFilterType] = useState("collection");
   const [filterValue, setFilterValue] = useState("");
   const [mode, setMode] = useState("percent");
@@ -139,7 +142,7 @@ export default function NewJob() {
 
   function submit(intent: "preview" | "create") {
     fetcher.submit(
-      { intent, mode, targetField, value, filterType, filterValue, runAt, revertAt },
+      { intent, name, mode, targetField, value, filterType, filterValue, runAt, revertAt },
       { method: "POST" },
     );
   }
@@ -150,6 +153,13 @@ export default function NewJob() {
       <BlockStack gap="400">
         <Card>
           <FormLayout>
+            <TextField
+              label="Name (optional)"
+              placeholder="e.g. Summer sale — riding gear -15%"
+              value={name}
+              onChange={setName}
+              autoComplete="off"
+            />
             <Select
               label="Target by"
               options={FILTER_OPTIONS}
@@ -192,6 +202,13 @@ export default function NewJob() {
               onChange={setValue}
               autoComplete="off"
             />
+            {mode === "percent" && targetField === "price" && Number(value) < 0 && (
+              <Banner tone="info">
+                This is a markdown — compare-at-price will be set to each
+                variant's current price automatically, so the discount shows
+                with a strikethrough.
+              </Banner>
+            )}
 
             <TextField
               label="Run at (leave blank to run immediately)"

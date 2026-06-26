@@ -85,6 +85,7 @@ export function buildPreview(params: {
 
 export async function createJob(params: {
   shopName: string;
+  name?: string | null;
   mode: JobMode;
   targetField: JobTargetField;
   value: number | null;
@@ -94,12 +95,23 @@ export async function createJob(params: {
   revertAt: Date | null;
   items: JobItemPreview[];
 }) {
-  const { shopName, mode, targetField, value, filterType, filterValue, runAt, revertAt, items } =
-    params;
+  const {
+    shopName,
+    name,
+    mode,
+    targetField,
+    value,
+    filterType,
+    filterValue,
+    runAt,
+    revertAt,
+    items,
+  } = params;
 
   return prisma.priceJob.create({
     data: {
       shopName,
+      name: name || null,
       mode,
       targetField,
       value,

@@ -35,6 +35,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return {
     jobs: jobs.map((job) => ({
       id: job.id,
+      name: job.name,
       status: job.status,
       mode: job.mode,
       targetField: job.targetField,
@@ -74,6 +75,7 @@ export default function Index() {
             selectedItemsCount={resourceState.selectedResources.length}
             onSelectionChange={resourceState.handleSelectionChange}
             headings={[
+              { title: "Name" },
               { title: "Created" },
               { title: "Filter" },
               { title: "Rule" },
@@ -89,6 +91,11 @@ export default function Index() {
                 position={index}
                 onClick={() => navigate(`/app/jobs/${job.id}`)}
               >
+                <IndexTable.Cell>
+                  <Text as="span" variant="bodyMd" fontWeight="medium">
+                    {job.name || "—"}
+                  </Text>
+                </IndexTable.Cell>
                 <IndexTable.Cell>
                   <Text as="span" variant="bodyMd">
                     {new Date(job.createdAt).toLocaleString()}

@@ -27,6 +27,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   return {
     job: {
       id: job.id,
+      name: job.name,
       status: job.status,
       mode: job.mode,
       targetField: job.targetField,
@@ -94,7 +95,7 @@ export default function JobDetail() {
 
   return (
     <Page>
-      <TitleBar title={`Price change — ${job.filterType}`}>
+      <TitleBar title={job.name || `Price change — ${job.filterType}`}>
         {canRevert && (
           <button
             variant="primary"

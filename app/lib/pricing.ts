@@ -45,8 +45,14 @@ export function computeUpdatedPrices(params: {
       ? computeNewValue(mode, value, oldPrice) ?? oldPrice
       : oldPrice;
 
-  const newCompareAtPrice =
-    targetField === "compareAtPrice" || targetField === "both"
+  // A percent markdown that only targets Price implies a sale: show the
+  // pre-discount price as the strikethrough compare-at-price, overwriting
+  // any compare-at-price the variant already had.
+  const isPercentMarkdown = mode === "percent" && value < 0 && targetField === "price";
+
+  const newCompareAtPrice = isPercentMarkdown
+    ? oldPrice
+    : targetField === "compareAtPrice" || targetField === "both"
       ? computeNewValue(mode, value, oldCompareAtPrice)
       : oldCompareAtPrice;
 

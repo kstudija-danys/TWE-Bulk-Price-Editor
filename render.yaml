@@ -18,24 +18,3 @@ services:
         value: read_products,write_products
       - key: SHOPIFY_APP_URL
         sync: false
-
-  - type: worker
-    name: bulk-price-editor-worker
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
-    dockerCommand: npm run docker-start-worker
-    plan: starter
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: DATABASE_URL
-        sync: false
-      - key: SHOPIFY_API_KEY
-        sync: false
-      - key: SHOPIFY_API_SECRET
-        sync: false
-      - key: SCOPES
-        value: read_products,write_products
-      - key: SHOPIFY_APP_URL
-        sync: false

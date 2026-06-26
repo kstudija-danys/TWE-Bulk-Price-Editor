@@ -2,7 +2,7 @@
 
 client_id = "2b2556a262e7acc14b0d3c6169062189"
 name = "bulk-price-editor"
-application_url = "https://example.com"
+application_url = "https://twe-bulk-price-editor.onrender.com"
 embedded = true
 
 [access_scopes]
@@ -10,7 +10,7 @@ embedded = true
 scopes = "read_products,write_products"
 
 [auth]
-redirect_urls = ["https://example.com/auth/callback"]
+redirect_urls = ["https://twe-bulk-price-editor.onrender.com/auth/callback"]
 
 [webhooks]
 api_version = "2024-10"

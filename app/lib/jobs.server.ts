@@ -53,7 +53,10 @@ function searchQueryForAdvancedFilter(filterValue: string): string {
     ...filter.tags.map((t) => `tag:'${escapeQueryValue(t)}'`),
     ...filter.vendors.map((v) => `vendor:'${escapeQueryValue(v)}'`),
     ...filter.productTypes.map((p) => `product_type:'${escapeQueryValue(p)}'`),
-    ...filter.collectionIds.map((c) => `collection_id:${c}`),
+    ...filter.collectionIds.map((c) => {
+      const numericId = c.includes("/") ? c.split("/").pop() : c;
+      return `collection_id:${numericId}`;
+    }),
   ];
 
   if (clauses.length === 0) {

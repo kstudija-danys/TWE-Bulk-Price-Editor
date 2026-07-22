@@ -64,11 +64,15 @@ export const action = async ({
   params,
 }: ActionFunctionArgs): Promise<RevertActionResponse> => {
   const { admin } = await authenticate.admin(request);
+  console.log(`[revert] POST received for job ${params.id}`);
   try {
     const result = await revertJob(admin, params.id as string);
+    console.log(`[revert] success: ${result?.succeeded?.length} succeeded, ${result?.failed?.length} failed`);
     return { ok: true, result };
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[revert] error for job ${params.id}:`, message);
+    return { ok: false, error: message };
   }
 };
 

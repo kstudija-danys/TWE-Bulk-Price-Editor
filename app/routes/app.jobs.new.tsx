@@ -13,6 +13,7 @@ import {
   Text,
   DataTable,
   Banner,
+  Checkbox,
 } from "@shopify/polaris";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -23,6 +24,7 @@ import type { JobFilterType } from "@prisma/client";
 type ActionResponse = {
   intent: "preview" | "create";
   items?: ReturnType<typeof buildPreview>;
+  skippedCount?: number;
   jobId?: string;
   error?: string;
 };
@@ -40,17 +42,34 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
   const filterValue = formData.get("filterValue") as string;
   const runAtRaw = formData.get("runAt") as string;
   const revertAtRaw = formData.get("revertAt") as string;
+  const skipExistingCompareAt = formData.get("skipExistingCompareAt") === "true";
 
   try {
-    const variants = await resolveJobVariants(admin, filterType, filterValue);
-    if (variants.length === 0) {
+    const allVariants = await resolveJobVariants(admin, filterType, filterValue);
+    if (allVariants.length === 0) {
       return { intent, items: [], error: "No matching variants found for this filter." };
+    }
+
+    // Optionally leave variants that already have a compare-at price untouched,
+    // so an existing sale/strikethrough price is never overwritten.
+    const variants = skipExistingCompareAt
+      ? allVariants.filter((v) => !hasCompareAtPrice(v.compareAtPrice))
+      : allVariants;
+    const skippedCount = allVariants.length - variants.length;
+
+    if (variants.length === 0) {
+      return {
+        intent,
+        items: [],
+        skippedCount,
+        error: `All ${skippedCount} matching variant(s) already have a compare-at price, so nothing would change.`,
+      };
     }
 
     const items = buildPreview({ mode, targetField, value, variants });
 
     if (intent === "preview") {
-      return { intent, items };
+      return { intent, items, skippedCount };
     }
 
     const runAt = runAtRaw ? new Date(runAtRaw) : null;
@@ -79,6 +98,10 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
     return { intent, error: message };
   }
 };
+
+function hasCompareAtPrice(compareAtPrice: string | null): boolean {
+  return compareAtPrice !== null && Number(compareAtPrice) > 0;
+}
 
 const FILTER_OPTIONS = [
   { label: "Filter by tag / vendor / product type / collection", value: "advanced" },
@@ -120,9 +143,11 @@ export default function NewJob() {
   const [value, setValue] = useState("");
   const [runAt, setRunAt] = useState("");
   const [revertAt, setRevertAt] = useState("");
+  const [skipExistingCompareAt, setSkipExistingCompareAt] = useState(false);
 
   const isLoading = fetcher.state !== "idle";
   const preview = fetcher.data?.intent === "preview" ? fetcher.data.items : null;
+  const skippedCount = fetcher.data?.intent === "preview" ? fetcher.data.skippedCount ?? 0 : 0;
   const previewError = fetcher.data?.error;
 
   if (fetcher.data?.intent === "create" && fetcher.data.jobId) {
@@ -197,6 +222,7 @@ export default function NewJob() {
         filterValue: buildFilterValue(),
         runAt,
         revertAt,
+        skipExistingCompareAt: String(skipExistingCompareAt),
       },
       { method: "POST" },
     );
@@ -297,6 +323,12 @@ export default function NewJob() {
                 with a strikethrough.
               </Banner>
             )}
+            <Checkbox
+              label="Skip products that already have a compare-at price"
+              helpText="Variants with an existing compare-at price are left completely unchanged (price and compare-at), so an existing sale isn't overwritten."
+              checked={skipExistingCompareAt}
+              onChange={setSkipExistingCompareAt}
+            />
 
             <TextField
               label="Run at (leave blank to run immediately)"
@@ -348,6 +380,12 @@ export default function NewJob() {
                   item.newCompareAtPrice?.toFixed(2) ?? "—",
                 ])}
               />
+              {skippedCount > 0 && (
+                <Text as="span" tone="subdued">
+                  Skipping {skippedCount} variant{skippedCount === 1 ? "" : "s"} that
+                  already {skippedCount === 1 ? "has" : "have"} a compare-at price.
+                </Text>
+              )}
               {preview.length > 100 && (
                 <Text as="span" tone="subdued">
                   Showing first 100 of {preview.length} variants.

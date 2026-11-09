@@ -17,7 +17,12 @@ import {
 } from "@shopify/polaris";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
-import { buildPreview, createJob, executeJob, resolveJobVariants } from "../lib/jobs.server";
+import {
+  buildPreview,
+  createJob,
+  executeJobInBackground,
+  resolveJobVariants,
+} from "../lib/jobs.server";
 import type { JobMode, JobTargetField } from "../lib/pricing";
 import type { JobFilterType } from "@prisma/client";
 
@@ -89,7 +94,8 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
     });
 
     if (!runAt || runAt.getTime() <= Date.now()) {
-      await executeJob(admin, job.id);
+      // Don't wait: the job page shows live progress while it runs.
+      executeJobInBackground(session.shop, job.id);
     }
 
     return { intent, jobId: job.id };

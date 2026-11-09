@@ -1,6 +1,8 @@
 import prisma from "../db.server";
+import { unauthenticated } from "../shopify.server";
 import {
   applyVariantPriceUpdates,
+  type BatchResult,
   resolveVariantsByIds,
   resolveVariantsByQuery,
   type ResolvedVariant,
@@ -210,6 +212,28 @@ async function claimJobForExecution(jobId: string) {
   });
 }
 
+/** Writes one batch's outcome to the job's items as soon as Shopify answers, so the job page can show live progress. */
+async function recordBatch(jobId: string, successStatus: "applied" | "reverted", batch: BatchResult) {
+  const ops = [];
+  if (batch.succeeded.length) {
+    ops.push(
+      prisma.priceJobItem.updateMany({
+        where: { jobId, variantId: { in: batch.succeeded } },
+        data: { status: successStatus, errorMessage: null },
+      }),
+    );
+  }
+  for (const f of batch.failed) {
+    ops.push(
+      prisma.priceJobItem.updateMany({
+        where: { jobId, variantId: f.variantId },
+        data: { status: "error", errorMessage: f.error },
+      }),
+    );
+  }
+  if (ops.length) await prisma.$transaction(ops);
+}
+
 export async function executeJob(admin: AdminGraphqlClient, jobId: string) {
   const job = await claimJobForExecution(jobId);
   if (!job) return;
@@ -222,19 +246,10 @@ export async function executeJob(admin: AdminGraphqlClient, jobId: string) {
       price: item.newPrice.toString(),
       compareAtPrice: item.newCompareAtPrice?.toString() ?? null,
     })),
+    (batch) => recordBatch(jobId, "applied", batch),
   );
 
-  const failedMap = new Map(failed.map((f) => [f.variantId, f.error]));
-
   await prisma.$transaction([
-    ...job.items.map((item) =>
-      prisma.priceJobItem.update({
-        where: { id: item.id },
-        data: failedMap.has(item.variantId)
-          ? { status: "error", errorMessage: failedMap.get(item.variantId) }
-          : { status: "applied" },
-      }),
-    ),
     prisma.priceJob.update({
       where: { id: jobId },
       data: {
@@ -248,6 +263,35 @@ export async function executeJob(admin: AdminGraphqlClient, jobId: string) {
   ]);
 
   return { succeeded, failed };
+}
+
+/**
+ * Starts a job without waiting for it, so large jobs don't hold the browser
+ * request open for minutes. Progress is written per batch and shown on the
+ * job page. Uses an offline admin client so it keeps working after the
+ * request that started it has returned.
+ */
+export function executeJobInBackground(shopName: string, jobId: string) {
+  void (async () => {
+    try {
+      const { admin } = await unauthenticated.admin(shopName);
+      const result = await executeJob(admin, jobId);
+      console.log(
+        `[jobs] job ${jobId} finished: ${result?.succeeded.length ?? 0} succeeded, ${result?.failed.length ?? 0} failed`,
+      );
+    } catch (error) {
+      console.error(`[jobs] job ${jobId} crashed`, error);
+      await prisma.priceJob
+        .update({
+          where: { id: jobId },
+          data: {
+            status: "failed",
+            errorMessage: error instanceof Error ? error.message : String(error),
+          },
+        })
+        .catch((e) => console.error(`[jobs] could not mark job ${jobId} as failed`, e));
+    }
+  })();
 }
 
 export async function revertJob(admin: AdminGraphqlClient, jobId: string) {
@@ -266,19 +310,10 @@ export async function revertJob(admin: AdminGraphqlClient, jobId: string) {
       price: item.oldPrice.toString(),
       compareAtPrice: item.oldCompareAtPrice?.toString() ?? null,
     })),
+    (batch) => recordBatch(jobId, "reverted", batch),
   );
 
-  const failedMap = new Map(failed.map((f) => [f.variantId, f.error]));
-
   await prisma.$transaction([
-    ...appliedItems.map((item) =>
-      prisma.priceJobItem.update({
-        where: { id: item.id },
-        data: failedMap.has(item.variantId)
-          ? { status: "error", errorMessage: failedMap.get(item.variantId) }
-          : { status: "reverted" },
-      }),
-    ),
     prisma.priceJob.update({
       where: { id: jobId },
       data: {

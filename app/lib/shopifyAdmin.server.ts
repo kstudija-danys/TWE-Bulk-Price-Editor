@@ -61,9 +61,16 @@ function chunk<T>(items: T[], size: number): T[][] {
  * mutation is scoped to one product per call) and batches within that.
  * Returns the variant ids that failed, with their error messages.
  */
+export type BatchResult = {
+  succeeded: string[];
+  failed: { variantId: string; error: string }[];
+};
+
 export async function applyVariantPriceUpdates(
   admin: AdminGraphqlClient,
   updates: VariantPriceUpdate[],
+  /** Called after each Shopify call with that batch's results, so callers can record progress. */
+  onBatchDone?: (result: BatchResult) => Promise<void>,
 ): Promise<{ succeeded: string[]; failed: { variantId: string; error: string }[] }> {
   const byProduct = new Map<string, VariantPriceUpdate[]>();
   for (const update of updates) {
@@ -77,6 +84,8 @@ export async function applyVariantPriceUpdates(
 
   for (const [productId, productUpdates] of byProduct) {
     for (const batch of chunk(productUpdates, MAX_VARIANTS_PER_CALL)) {
+      const batchSucceeded: string[] = [];
+      const batchFailed: { variantId: string; error: string }[] = [];
       try {
         const json = await graphqlWithRetry(
           admin,
@@ -107,22 +116,27 @@ export async function applyVariantPriceUpdates(
           const message = userErrors
             .map((e: { message: string }) => e.message)
             .join("; ");
-          for (const u of batch) failed.push({ variantId: u.variantId, error: message });
-          continue;
-        }
-
-        const updatedIds = new Set(
-          (json.data?.productVariantsBulkUpdate?.productVariants ?? []).map(
-            (v: { id: string }) => v.id,
-          ),
-        );
-        for (const u of batch) {
-          if (updatedIds.has(u.variantId)) succeeded.push(u.variantId);
-          else failed.push({ variantId: u.variantId, error: "Not returned by Shopify" });
+          for (const u of batch) batchFailed.push({ variantId: u.variantId, error: message });
+        } else {
+          const updatedIds = new Set(
+            (json.data?.productVariantsBulkUpdate?.productVariants ?? []).map(
+              (v: { id: string }) => v.id,
+            ),
+          );
+          for (const u of batch) {
+            if (updatedIds.has(u.variantId)) batchSucceeded.push(u.variantId);
+            else batchFailed.push({ variantId: u.variantId, error: "Not returned by Shopify" });
+          }
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        for (const u of batch) failed.push({ variantId: u.variantId, error: message });
+        for (const u of batch) batchFailed.push({ variantId: u.variantId, error: message });
+      }
+
+      succeeded.push(...batchSucceeded);
+      failed.push(...batchFailed);
+      if (onBatchDone) {
+        await onBatchDone({ succeeded: batchSucceeded, failed: batchFailed });
       }
     }
   }

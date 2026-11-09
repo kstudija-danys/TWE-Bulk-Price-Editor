@@ -1,5 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useFetcher, useLoaderData } from "@remix-run/react";
+import { useEffect } from "react";
+import { useFetcher, useLoaderData, useRevalidator } from "@remix-run/react";
 import {
   Page,
   Card,
@@ -8,6 +9,7 @@ import {
   Badge,
   DataTable,
   Banner,
+  ProgressBar,
 } from "@shopify/polaris";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -90,8 +92,27 @@ export default function JobDetail() {
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
 
+  const revalidator = useRevalidator();
+
   const canRevert = job.status === "completed";
   const isReverting = fetcher.state !== "idle";
+
+  // A job started with "Apply" runs in the background; it is "draft" for a
+  // moment and then "running" until every variant has been processed.
+  const isInProgress = job.status === "running" || (job.status === "draft" && !job.runAt);
+  const processedCount = job.items.filter((i) => i.status !== "pending").length;
+  const errorCount = job.items.filter((i) => i.status === "error").length;
+  const progressPercent = job.items.length
+    ? Math.round((processedCount / job.items.length) * 100)
+    : 0;
+
+  useEffect(() => {
+    if (!isInProgress) return;
+    const timer = setInterval(() => {
+      if (revalidator.state === "idle") revalidator.revalidate();
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [isInProgress, revalidator]);
 
   if (fetcher.data?.ok) {
     shopify.toast.show("Job reverted");
@@ -115,6 +136,16 @@ export default function JobDetail() {
         <Card>
           <BlockStack gap="200">
             <InlineSummary job={job} />
+            {isInProgress && (
+              <BlockStack gap="100">
+                <ProgressBar progress={progressPercent} tone="primary" />
+                <Text as="p" tone="subdued">
+                  Updating prices… {processedCount} of {job.items.length} variants done
+                  {errorCount > 0 ? ` (${errorCount} failed)` : ""}. You can leave this
+                  page — the job keeps running.
+                </Text>
+              </BlockStack>
+            )}
             {job.errorMessage && <Banner tone="warning">{job.errorMessage}</Banner>}
             {fetcher.data && !fetcher.data.ok && (
               <Banner tone="critical">{fetcher.data.error}</Banner>

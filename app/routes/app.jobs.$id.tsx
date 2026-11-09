@@ -14,7 +14,7 @@ import {
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { revertJob } from "../lib/jobs.server";
+import { isJobActiveInThisProcess, resumeJobInBackground, revertJob } from "../lib/jobs.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -41,6 +41,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       createdAt: job.createdAt.toISOString(),
       completedAt: job.completedAt?.toISOString() ?? null,
       errorMessage: job.errorMessage,
+      // "running" in the DB but not being worked on by the server: it was cut off.
+      isStuck: job.status === "running" && !isJobActiveInThisProcess(job.id),
       items: job.items.map((i) => ({
         id: i.id,
         sku: i.sku,
@@ -57,6 +59,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 
 type RevertActionResponse = {
   ok: boolean;
+  intent?: "revert" | "resume";
   result?: { succeeded: string[]; failed: { variantId: string; error: string }[] };
   error?: string;
 };
@@ -65,16 +68,30 @@ export const action = async ({
   request,
   params,
 }: ActionFunctionArgs): Promise<RevertActionResponse> => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+  const formData = await request.formData();
+
+  if (formData.get("intent") === "resume") {
+    const job = await prisma.priceJob.findFirst({
+      where: { id: params.id, shopName: session.shop },
+    });
+    if (!job || job.status !== "running" || isJobActiveInThisProcess(job.id)) {
+      return { ok: false, intent: "resume", error: "This job isn't stuck, so there's nothing to resume." };
+    }
+    console.log(`[resume] resuming job ${job.id}`);
+    resumeJobInBackground(session.shop, job.id);
+    return { ok: true, intent: "resume" };
+  }
+
   console.log(`[revert] POST received for job ${params.id}`);
   try {
     const result = await revertJob(admin, params.id as string);
     console.log(`[revert] success: ${result?.succeeded?.length} succeeded, ${result?.failed?.length} failed`);
-    return { ok: true, result };
+    return { ok: true, intent: "revert", result };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[revert] error for job ${params.id}:`, message);
-    return { ok: false, error: message };
+    return { ok: false, intent: "revert", error: message };
   }
 };
 
@@ -99,24 +116,34 @@ export default function JobDetail() {
 
   // A job started with "Apply" runs in the background; it is "draft" for a
   // moment and then "running" until every variant has been processed.
-  const isInProgress = job.status === "running" || (job.status === "draft" && !job.runAt);
+  const isActive = job.status === "running" || (job.status === "draft" && !job.runAt);
+  const isInProgress = isActive && !job.isStuck;
   const processedCount = job.items.filter((i) => i.status !== "pending").length;
   const errorCount = job.items.filter((i) => i.status === "error").length;
   const progressPercent = job.items.length
     ? Math.round((processedCount / job.items.length) * 100)
     : 0;
 
+  // Keep refreshing while running; also while stuck, so the warning clears
+  // as soon as a resume has picked the job up.
   useEffect(() => {
-    if (!isInProgress) return;
+    if (!isActive) return;
     const timer = setInterval(() => {
       if (revalidator.state === "idle") revalidator.revalidate();
     }, 3000);
     return () => clearInterval(timer);
-  }, [isInProgress, revalidator]);
+  }, [isActive, revalidator]);
 
-  if (fetcher.data?.ok) {
-    shopify.toast.show("Job reverted");
-  }
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data?.ok) return;
+    if (fetcher.data.intent === "resume") {
+      shopify.toast.show("Resuming job");
+      revalidator.revalidate();
+    } else {
+      shopify.toast.show("Job reverted");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetcher.state, fetcher.data]);
 
   return (
     <Page>
@@ -125,7 +152,7 @@ export default function JobDetail() {
           <button
             variant="primary"
             tone="critical"
-            onClick={() => fetcher.submit({}, { method: "POST" })}
+            onClick={() => fetcher.submit({ intent: "revert" }, { method: "POST" })}
             disabled={isReverting}
           >
             Revert
@@ -145,6 +172,22 @@ export default function JobDetail() {
                   page — the job keeps running.
                 </Text>
               </BlockStack>
+            )}
+            {job.isStuck && (
+              <Banner
+                tone="critical"
+                title="This job was interrupted"
+                action={{
+                  content: "Resume job",
+                  loading: isReverting,
+                  onAction: () => fetcher.submit({ intent: "resume" }, { method: "POST" }),
+                }}
+              >
+                The server stopped while this job was running, so only some prices were
+                changed. Resume checks each variant's current price in Shopify: ones already
+                changed are marked done, ones still at the old price are updated, and any
+                changed by someone else are skipped.
+              </Banner>
             )}
             {job.errorMessage && <Banner tone="warning">{job.errorMessage}</Banner>}
             {fetcher.data && !fetcher.data.ok && (

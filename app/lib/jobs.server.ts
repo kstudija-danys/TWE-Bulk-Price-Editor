@@ -234,35 +234,134 @@ async function recordBatch(jobId: string, successStatus: "applied" | "reverted",
   if (ops.length) await prisma.$transaction(ops);
 }
 
+declare global {
+  // Jobs being worked on by this server process right now. A job whose DB
+  // status is "running" but isn't in here was cut off (e.g. a server restart).
+  var activeJobIds: Set<string> | undefined;
+}
+const activeJobIds = (global.activeJobIds ??= new Set<string>());
+
+export function isJobActiveInThisProcess(jobId: string): boolean {
+  return activeJobIds.has(jobId);
+}
+
+type JobItemRow = Awaited<ReturnType<typeof prisma.priceJobItem.findMany>>[number];
+
+/** Applies the given items' new prices, records progress per batch, then sets the job's final status from all its items. */
+async function applyItemsAndFinish(admin: AdminGraphqlClient, jobId: string, items: JobItemRow[]) {
+  activeJobIds.add(jobId);
+  try {
+    const { succeeded, failed } = await applyVariantPriceUpdates(
+      admin,
+      items.map((item) => ({
+        variantId: item.variantId,
+        productId: item.productId,
+        price: item.newPrice.toString(),
+        compareAtPrice: item.newCompareAtPrice?.toString() ?? null,
+      })),
+      (batch) => recordBatch(jobId, "applied", batch),
+    );
+
+    const total = await prisma.priceJobItem.count({ where: { jobId } });
+    const errors = await prisma.priceJobItem.count({ where: { jobId, status: "error" } });
+
+    await prisma.priceJob.update({
+      where: { id: jobId },
+      data: {
+        status: errors === total && total > 0 ? "failed" : "completed",
+        completedAt: new Date(),
+        errorMessage: errors ? `${errors} of ${total} variants failed to update.` : null,
+      },
+    });
+
+    return { succeeded, failed };
+  } finally {
+    activeJobIds.delete(jobId);
+  }
+}
+
 export async function executeJob(admin: AdminGraphqlClient, jobId: string) {
   const job = await claimJobForExecution(jobId);
   if (!job) return;
+  return applyItemsAndFinish(admin, jobId, job.items);
+}
 
-  const { succeeded, failed } = await applyVariantPriceUpdates(
-    admin,
-    job.items.map((item) => ({
-      variantId: item.variantId,
-      productId: item.productId,
-      price: item.newPrice.toString(),
-      compareAtPrice: item.newCompareAtPrice?.toString() ?? null,
-    })),
-    (batch) => recordBatch(jobId, "applied", batch),
-  );
+function sameMoney(a: number | null, b: number | null): boolean {
+  if (a === null || b === null) return a === b;
+  return Math.abs(a - b) < 0.005;
+}
 
-  await prisma.$transaction([
-    prisma.priceJob.update({
-      where: { id: jobId },
-      data: {
-        status: failed.length === job.items.length && job.items.length > 0 ? "failed" : "completed",
-        completedAt: new Date(),
-        errorMessage: failed.length
-          ? `${failed.length} of ${job.items.length} variants failed to update.`
-          : null,
-      },
-    }),
-  ]);
+/**
+ * Finishes a job that was cut off mid-run. Reads every unfinished variant's
+ * current price from Shopify:
+ * - already at the job's new price → marked applied (it went through before the cut-off)
+ * - still at the job's old price → applied now
+ * - anything else (changed by someone else, or deleted) → marked as an error and left alone
+ */
+export async function resumeJob(admin: AdminGraphqlClient, jobId: string) {
+  const job = await prisma.priceJob.findUnique({ where: { id: jobId }, include: { items: true } });
+  // Not stuck (finished, or still being worked on): nothing to do. Returning
+  // instead of throwing so a double click can't mark a healthy job as failed.
+  if (!job || job.status !== "running" || activeJobIds.has(jobId)) {
+    console.log(`[jobs] resume ignored for job ${jobId}: not stuck`);
+    return;
+  }
 
-  return { succeeded, failed };
+  activeJobIds.add(jobId);
+  let toApply: JobItemRow[] = [];
+  try {
+    const pending = job.items.filter((i) => i.status === "pending");
+    const current = await resolveVariantsByIds(
+      admin,
+      pending.map((i) => i.variantId),
+    );
+    const currentById = new Map(current.map((v) => [v.variantId, v]));
+
+    const alreadyApplied: string[] = [];
+    const errors: { variantId: string; error: string }[] = [];
+
+    for (const item of pending) {
+      const live = currentById.get(item.variantId);
+      if (!live) {
+        errors.push({ variantId: item.variantId, error: "Variant no longer exists in Shopify." });
+        continue;
+      }
+      const price = Number(live.price);
+      const compareAt = live.compareAtPrice !== null ? Number(live.compareAtPrice) : null;
+      const newCompareAt = item.newCompareAtPrice !== null ? Number(item.newCompareAtPrice) : null;
+      const oldCompareAt = item.oldCompareAtPrice !== null ? Number(item.oldCompareAtPrice) : null;
+
+      // A null new compare-at means the job doesn't touch it, so any value matches.
+      const isNew =
+        sameMoney(price, Number(item.newPrice)) &&
+        (newCompareAt === null || sameMoney(compareAt, newCompareAt));
+      const isOld = sameMoney(price, Number(item.oldPrice)) && sameMoney(compareAt, oldCompareAt);
+
+      if (isNew) alreadyApplied.push(item.variantId);
+      else if (isOld) toApply.push(item);
+      else
+        errors.push({
+          variantId: item.variantId,
+          error: `Skipped: price was changed outside this job (now ${live.price}${live.compareAtPrice ? `, compare-at ${live.compareAtPrice}` : ""}).`,
+        });
+    }
+
+    await recordBatch(jobId, "applied", { succeeded: alreadyApplied, failed: errors });
+    console.log(
+      `[jobs] resuming job ${jobId}: ${alreadyApplied.length} already applied, ${toApply.length} to apply, ${errors.length} skipped`,
+    );
+  } catch (error) {
+    activeJobIds.delete(jobId);
+    throw error;
+  }
+  activeJobIds.delete(jobId);
+
+  return applyItemsAndFinish(admin, jobId, toApply);
+}
+
+/** Starts resumeJob without waiting for it; progress shows on the job page. */
+export function resumeJobInBackground(shopName: string, jobId: string) {
+  runInBackground(shopName, jobId, resumeJob);
 }
 
 /**
@@ -272,10 +371,21 @@ export async function executeJob(admin: AdminGraphqlClient, jobId: string) {
  * request that started it has returned.
  */
 export function executeJobInBackground(shopName: string, jobId: string) {
+  runInBackground(shopName, jobId, executeJob);
+}
+
+function runInBackground(
+  shopName: string,
+  jobId: string,
+  run: (
+    admin: AdminGraphqlClient,
+    jobId: string,
+  ) => Promise<{ succeeded: string[]; failed: unknown[] } | undefined>,
+) {
   void (async () => {
     try {
       const { admin } = await unauthenticated.admin(shopName);
-      const result = await executeJob(admin, jobId);
+      const result = await run(admin, jobId);
       console.log(
         `[jobs] job ${jobId} finished: ${result?.succeeded.length ?? 0} succeeded, ${result?.failed.length ?? 0} failed`,
       );

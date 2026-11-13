@@ -58,3 +58,65 @@ export function computeUpdatedPrices(params: {
 
   return { newPrice, newCompareAtPrice };
 }
+
+/**
+ * Works out a market's fixed price (e.g. the UK's GBP price) from the change
+ * made to the base price, so every market moves by the same proportion:
+ * - percent rules apply the same percentage to the fixed price
+ * - fixed-amount, set-value and CSV changes scale it by newBase / oldBase
+ * - a percent markdown on Price sets the market compare-at to its old fixed price
+ */
+export function computeMarketPrices(params: {
+  mode: JobMode;
+  targetField: JobTargetField;
+  value: number;
+  oldPrice: number;
+  newPrice: number;
+  oldCompareAtPrice: number | null;
+  newCompareAtPrice: number | null;
+  fixedPrice: number;
+  fixedCompareAtPrice: number | null;
+}): { newFixedPrice: number; newFixedCompareAtPrice: number | null } {
+  const {
+    mode,
+    targetField,
+    value,
+    oldPrice,
+    newPrice,
+    oldCompareAtPrice,
+    newCompareAtPrice,
+    fixedPrice,
+    fixedCompareAtPrice,
+  } = params;
+
+  const scale = (amount: number, from: number, to: number) =>
+    from > 0 ? Math.max(0, round2((amount * to) / from)) : amount;
+
+  const changesPrice = targetField === "price" || targetField === "both" || mode === "csv";
+  const newFixedPrice = !changesPrice
+    ? fixedPrice
+    : mode === "percent"
+      ? computeNewValue(mode, value, fixedPrice) ?? fixedPrice
+      : scale(fixedPrice, oldPrice, newPrice);
+
+  const isPercentMarkdown = mode === "percent" && value < 0 && targetField === "price";
+  const changesCompareAt =
+    targetField === "compareAtPrice" || targetField === "both" || mode === "csv";
+
+  let newFixedCompareAtPrice = fixedCompareAtPrice;
+  if (isPercentMarkdown) {
+    newFixedCompareAtPrice = fixedPrice;
+  } else if (changesCompareAt && newCompareAtPrice !== null) {
+    if (mode === "percent" && fixedCompareAtPrice !== null) {
+      newFixedCompareAtPrice = computeNewValue(mode, value, fixedCompareAtPrice);
+    } else if (fixedCompareAtPrice !== null && oldCompareAtPrice) {
+      newFixedCompareAtPrice = scale(fixedCompareAtPrice, oldCompareAtPrice, newCompareAtPrice);
+    } else {
+      // No market compare-at yet: derive one from the base compare-at, at the
+      // same ratio the market's price has to the base price.
+      newFixedCompareAtPrice = scale(newCompareAtPrice, oldPrice, fixedPrice);
+    }
+  }
+
+  return { newFixedPrice, newFixedCompareAtPrice };
+}

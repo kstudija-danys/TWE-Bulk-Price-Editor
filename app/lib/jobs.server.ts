@@ -1,13 +1,21 @@
 import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
 import {
+  applyFixedPriceUpdates,
   applyVariantPriceUpdates,
+  fetchMarketFixedPrices,
+  type MarketFixedPrice,
   type BatchResult,
   resolveVariantsByIds,
   resolveVariantsByQuery,
   type ResolvedVariant,
 } from "./shopifyAdmin.server";
-import { computeUpdatedPrices, type JobMode, type JobTargetField } from "./pricing";
+import {
+  computeMarketPrices,
+  computeUpdatedPrices,
+  type JobMode,
+  type JobTargetField,
+} from "./pricing";
 import type { JobFilterType } from "@prisma/client";
 
 type AdminGraphqlClient = Parameters<typeof resolveVariantsByQuery>[0];
@@ -21,6 +29,90 @@ export type JobItemPreview = {
   oldCompareAtPrice: number | null;
   newCompareAtPrice: number | null;
 };
+
+export type MarketPriceChange = {
+  priceListId: string;
+  marketName: string;
+  currency: string;
+  oldPrice: number;
+  newPrice: number;
+  oldCompareAtPrice: number | null;
+  newCompareAtPrice: number | null;
+};
+
+type PriceRule = {
+  mode: JobMode;
+  targetField: JobTargetField;
+  value: number;
+  skipExistingCompareAt: boolean;
+};
+
+type BasePriceChange = {
+  variantId: string;
+  oldPrice: number;
+  newPrice: number;
+  oldCompareAtPrice: number | null;
+  newCompareAtPrice: number | null;
+};
+
+/**
+ * Works out the market fixed-price changes (e.g. UK GBP prices) that go with
+ * each variant's base price change. Fixed prices that already have a
+ * compare-at price are left out when skipExistingCompareAt is on.
+ */
+function computeMarketChanges(
+  rule: PriceRule,
+  items: BasePriceChange[],
+  fixedPrices: Map<string, MarketFixedPrice[]>,
+): Map<string, MarketPriceChange[]> {
+  const out = new Map<string, MarketPriceChange[]>();
+  for (const item of items) {
+    const changes: MarketPriceChange[] = [];
+    for (const fixed of fixedPrices.get(item.variantId) ?? []) {
+      const fixedPrice = Number(fixed.price);
+      const fixedCompareAtPrice =
+        fixed.compareAtPrice !== null ? Number(fixed.compareAtPrice) : null;
+      if (rule.skipExistingCompareAt && fixedCompareAtPrice !== null && fixedCompareAtPrice > 0) {
+        continue;
+      }
+      const { newFixedPrice, newFixedCompareAtPrice } = computeMarketPrices({
+        mode: rule.mode,
+        targetField: rule.targetField,
+        value: rule.value,
+        oldPrice: item.oldPrice,
+        newPrice: item.newPrice,
+        oldCompareAtPrice: item.oldCompareAtPrice,
+        newCompareAtPrice: item.newCompareAtPrice,
+        fixedPrice,
+        fixedCompareAtPrice,
+      });
+      changes.push({
+        priceListId: fixed.priceListId,
+        marketName: fixed.marketName,
+        currency: fixed.currency,
+        oldPrice: fixedPrice,
+        newPrice: newFixedPrice,
+        oldCompareAtPrice: fixedCompareAtPrice,
+        newCompareAtPrice: newFixedCompareAtPrice,
+      });
+    }
+    if (changes.length) out.set(item.variantId, changes);
+  }
+  return out;
+}
+
+/** Market fixed-price changes for the preview step (reads current fixed prices from Shopify). */
+export async function previewMarketChanges(
+  admin: AdminGraphqlClient,
+  rule: PriceRule,
+  items: JobItemPreview[],
+): Promise<Record<string, MarketPriceChange[]>> {
+  const fixed = await fetchMarketFixedPrices(
+    admin,
+    items.map((i) => i.variantId),
+  );
+  return Object.fromEntries(computeMarketChanges(rule, items, fixed));
+}
 
 export type AdvancedFilter = {
   combinator: "AND" | "OR";
@@ -129,6 +221,7 @@ export async function createJob(params: {
   filterValue: string;
   runAt: Date | null;
   revertAt: Date | null;
+  skipExistingCompareAt: boolean;
   items: JobItemPreview[];
 }) {
   const {
@@ -141,6 +234,7 @@ export async function createJob(params: {
     filterValue,
     runAt,
     revertAt,
+    skipExistingCompareAt,
     items,
   } = params;
 
@@ -155,6 +249,7 @@ export async function createJob(params: {
       filterValue,
       runAt,
       revertAt,
+      skipExistingCompareAt,
       status: runAt && runAt.getTime() > Date.now() ? "scheduled" : "draft",
       items: {
         create: items.map((item) => ({
@@ -247,7 +342,144 @@ export function isJobActiveInThisProcess(jobId: string): boolean {
 
 type JobItemRow = Awaited<ReturnType<typeof prisma.priceJobItem.findMany>>[number];
 
-/** Applies the given items' new prices, records progress per batch, then sets the job's final status from all its items. */
+/**
+ * Records, for a job that has none yet, the market fixed prices (e.g. UK GBP)
+ * of the given items as they are in Shopify right now, with their new values.
+ */
+async function ensureMarketRows(admin: AdminGraphqlClient, jobId: string, items: JobItemRow[]) {
+  const job = await prisma.priceJob.findUniqueOrThrow({ where: { id: jobId } });
+  if (job.marketPricesRecorded) return;
+
+  const rule: PriceRule = {
+    mode: job.mode,
+    targetField: job.targetField,
+    value: job.value !== null ? Number(job.value) : 0,
+    skipExistingCompareAt: job.skipExistingCompareAt,
+  };
+  const base: BasePriceChange[] = items.map((i) => ({
+    variantId: i.variantId,
+    oldPrice: Number(i.oldPrice),
+    newPrice: Number(i.newPrice),
+    oldCompareAtPrice: i.oldCompareAtPrice !== null ? Number(i.oldCompareAtPrice) : null,
+    newCompareAtPrice: i.newCompareAtPrice !== null ? Number(i.newCompareAtPrice) : null,
+  }));
+
+  const fixed = await fetchMarketFixedPrices(
+    admin,
+    items.map((i) => i.variantId),
+  );
+  const changes = computeMarketChanges(rule, base, fixed);
+  const itemIdByVariant = new Map(items.map((i) => [i.variantId, i.id]));
+
+  const rows = [...changes].flatMap(([variantId, list]) =>
+    list.map((c) => ({
+      itemId: itemIdByVariant.get(variantId)!,
+      priceListId: c.priceListId,
+      marketName: c.marketName,
+      currency: c.currency,
+      oldPrice: c.oldPrice,
+      newPrice: c.newPrice,
+      oldCompareAtPrice: c.oldCompareAtPrice,
+      newCompareAtPrice: c.newCompareAtPrice,
+    })),
+  );
+  await prisma.$transaction([
+    prisma.priceJobMarketPrice.createMany({ data: rows }),
+    prisma.priceJob.update({ where: { id: jobId }, data: { marketPricesRecorded: true } }),
+  ]);
+  console.log(`[jobs] job ${jobId}: ${rows.length} market fixed prices to change`);
+}
+
+/**
+ * Writes market fixed prices to Shopify: the new values ("applied") for rows
+ * still pending whose variant's base price was applied, or the old values
+ * ("reverted") for rows that were applied.
+ */
+async function applyMarketRows(
+  admin: AdminGraphqlClient,
+  jobId: string,
+  direction: "applied" | "reverted",
+) {
+  const rows = await prisma.priceJobMarketPrice.findMany({
+    where:
+      direction === "applied"
+        ? { status: "pending", item: { jobId, status: "applied" } }
+        : { status: "applied", item: { jobId } },
+    include: { item: { select: { variantId: true } } },
+  });
+
+  const byPriceList = new Map<string, typeof rows>();
+  for (const row of rows) {
+    const list = byPriceList.get(row.priceListId) ?? [];
+    list.push(row);
+    byPriceList.set(row.priceListId, list);
+  }
+
+  for (const [priceListId, list] of byPriceList) {
+    await applyFixedPriceUpdates(
+      admin,
+      priceListId,
+      list.map((row) => {
+        const useNew = direction === "applied";
+        const price = useNew ? row.newPrice : row.oldPrice;
+        const compareAt = useNew ? row.newCompareAtPrice : row.oldCompareAtPrice;
+        return {
+          variantId: row.item.variantId,
+          currency: row.currency,
+          price: price.toString(),
+          compareAtPrice: compareAt?.toString() ?? null,
+        };
+      }),
+      async (batch) => {
+        const ops = [];
+        if (batch.succeeded.length) {
+          ops.push(
+            prisma.priceJobMarketPrice.updateMany({
+              where: { priceListId, item: { jobId, variantId: { in: batch.succeeded } } },
+              data: { status: direction, errorMessage: null },
+            }),
+          );
+        }
+        for (const f of batch.failed) {
+          ops.push(
+            prisma.priceJobMarketPrice.updateMany({
+              where: { priceListId, item: { jobId, variantId: f.variantId } },
+              data: { status: "error", errorMessage: f.error },
+            }),
+          );
+        }
+        if (ops.length) await prisma.$transaction(ops);
+      },
+    );
+  }
+}
+
+/** Sets a job's final status from its variants' and market prices' outcomes. */
+async function finishJob(jobId: string) {
+  const total = await prisma.priceJobItem.count({ where: { jobId } });
+  const errors = await prisma.priceJobItem.count({ where: { jobId, status: "error" } });
+  const marketErrors = await prisma.priceJobMarketPrice.count({
+    where: { status: "error", item: { jobId } },
+  });
+
+  const messages = [];
+  if (errors) messages.push(`${errors} of ${total} variants failed to update.`);
+  if (marketErrors) messages.push(`${marketErrors} market prices failed to update.`);
+
+  await prisma.priceJob.update({
+    where: { id: jobId },
+    data: {
+      status: errors === total && total > 0 ? "failed" : "completed",
+      completedAt: new Date(),
+      errorMessage: messages.length ? messages.join(" ") : null,
+    },
+  });
+}
+
+/**
+ * Applies the given items' new base prices (recording progress per batch),
+ * then the matching market fixed prices, then sets the job's final status.
+ */
 async function applyItemsAndFinish(admin: AdminGraphqlClient, jobId: string, items: JobItemRow[]) {
   activeJobIds.add(jobId);
   try {
@@ -262,17 +494,8 @@ async function applyItemsAndFinish(admin: AdminGraphqlClient, jobId: string, ite
       (batch) => recordBatch(jobId, "applied", batch),
     );
 
-    const total = await prisma.priceJobItem.count({ where: { jobId } });
-    const errors = await prisma.priceJobItem.count({ where: { jobId, status: "error" } });
-
-    await prisma.priceJob.update({
-      where: { id: jobId },
-      data: {
-        status: errors === total && total > 0 ? "failed" : "completed",
-        completedAt: new Date(),
-        errorMessage: errors ? `${errors} of ${total} variants failed to update.` : null,
-      },
-    });
+    await applyMarketRows(admin, jobId, "applied");
+    await finishJob(jobId);
 
     return { succeeded, failed };
   } finally {
@@ -283,8 +506,55 @@ async function applyItemsAndFinish(admin: AdminGraphqlClient, jobId: string, ite
 export async function executeJob(admin: AdminGraphqlClient, jobId: string) {
   const job = await claimJobForExecution(jobId);
   if (!job) return;
+  // Read market fixed prices before anything changes, so revert can restore them.
+  await ensureMarketRows(admin, jobId, job.items);
   return applyItemsAndFinish(admin, jobId, job.items);
 }
+
+/**
+ * For a completed job that ran before market prices were supported: changes
+ * the market fixed prices (e.g. UK GBP) of every variant the job updated, so
+ * they match. Revert then restores them along with the base prices.
+ */
+export async function applyMissingMarketPrices(
+  admin: AdminGraphqlClient,
+  jobId: string,
+  skipExistingCompareAt: boolean,
+) {
+  const job = await prisma.priceJob.findUnique({ where: { id: jobId }, include: { items: true } });
+  if (!job || job.status !== "completed" || job.marketPricesRecorded || activeJobIds.has(jobId)) {
+    return;
+  }
+
+  activeJobIds.add(jobId);
+  try {
+    await prisma.priceJob.update({
+      where: { id: jobId },
+      data: { status: "running", skipExistingCompareAt },
+    });
+    await ensureMarketRows(
+      admin,
+      jobId,
+      job.items.filter((i) => i.status === "applied"),
+    );
+    await applyMarketRows(admin, jobId, "applied");
+    await finishJob(jobId);
+    return { succeeded: [], failed: [] };
+  } finally {
+    activeJobIds.delete(jobId);
+  }
+}
+
+export function applyMissingMarketPricesInBackground(
+  shopName: string,
+  jobId: string,
+  skipExistingCompareAt: boolean,
+) {
+  runInBackground(shopName, jobId, (admin, id) =>
+    applyMissingMarketPrices(admin, id, skipExistingCompareAt),
+  );
+}
+
 
 function sameMoney(a: number | null, b: number | null): boolean {
   if (a === null || b === null) return a === b;
@@ -347,6 +617,10 @@ export async function resumeJob(admin: AdminGraphqlClient, jobId: string) {
     }
 
     await recordBatch(jobId, "applied", { succeeded: alreadyApplied, failed: errors });
+    // Jobs that started before market prices were supported have no market
+    // rows yet. Their market fixed prices were never touched, so reading them
+    // now still gives the right "old" values.
+    await ensureMarketRows(admin, jobId, job.items);
     console.log(
       `[jobs] resuming job ${jobId}: ${alreadyApplied.length} already applied, ${toApply.length} to apply, ${errors.length} skipped`,
     );
@@ -423,15 +697,24 @@ export async function revertJob(admin: AdminGraphqlClient, jobId: string) {
     (batch) => recordBatch(jobId, "reverted", batch),
   );
 
+  await applyMarketRows(admin, jobId, "reverted");
+  const marketErrors = await prisma.priceJobMarketPrice.count({
+    where: { status: "applied", item: { jobId } },
+  });
+
   await prisma.$transaction([
     prisma.priceJob.update({
       where: { id: jobId },
       data: {
         status: "reverted",
         revertedAt: new Date(),
-        errorMessage: failed.length
-          ? `${failed.length} of ${appliedItems.length} variants failed to revert.`
-          : null,
+        errorMessage:
+          [
+            failed.length ? `${failed.length} of ${appliedItems.length} variants failed to revert.` : "",
+            marketErrors ? `${marketErrors} market prices failed to revert.` : "",
+          ]
+            .filter(Boolean)
+            .join(" ") || null,
       },
     }),
   ]);

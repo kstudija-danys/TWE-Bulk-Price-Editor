@@ -21,7 +21,9 @@ import {
   buildPreview,
   createJob,
   executeJobInBackground,
+  previewMarketChanges,
   resolveJobVariants,
+  type MarketPriceChange,
 } from "../lib/jobs.server";
 import type { JobMode, JobTargetField } from "../lib/pricing";
 import type { JobFilterType } from "@prisma/client";
@@ -30,6 +32,9 @@ type ActionResponse = {
   intent: "preview" | "create";
   items?: ReturnType<typeof buildPreview>;
   skippedCount?: number;
+  /** Market fixed-price changes for the variants shown in the preview, keyed by variant id. */
+  marketChanges?: Record<string, MarketPriceChange[]>;
+  marketChangeCount?: number;
   jobId?: string;
   error?: string;
 };
@@ -74,7 +79,20 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
     const items = buildPreview({ mode, targetField, value, variants });
 
     if (intent === "preview") {
-      return { intent, items, skippedCount };
+      const allMarketChanges = await previewMarketChanges(
+        admin,
+        { mode, targetField, value, skipExistingCompareAt },
+        items,
+      );
+      const shown = new Set(items.slice(0, PREVIEW_ROWS).map((i) => i.variantId));
+      const marketChanges = Object.fromEntries(
+        Object.entries(allMarketChanges).filter(([variantId]) => shown.has(variantId)),
+      );
+      const marketChangeCount = Object.values(allMarketChanges).reduce(
+        (n, list) => n + list.length,
+        0,
+      );
+      return { intent, items, skippedCount, marketChanges, marketChangeCount };
     }
 
     const runAt = runAtRaw ? new Date(runAtRaw) : null;
@@ -90,6 +108,7 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
       filterValue,
       runAt,
       revertAt,
+      skipExistingCompareAt,
       items,
     });
 
@@ -104,6 +123,21 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
     return { intent, error: message };
   }
 };
+
+const PREVIEW_ROWS = 100;
+
+function formatMarketChanges(changes: MarketPriceChange[] | undefined): string {
+  if (!changes?.length) return "—";
+  return changes
+    .map(
+      (c) =>
+        `${c.marketName}: ${c.oldPrice.toFixed(2)} → ${c.newPrice.toFixed(2)} ${c.currency}` +
+        (c.newCompareAtPrice !== c.oldCompareAtPrice
+          ? ` (compare-at ${c.newCompareAtPrice?.toFixed(2) ?? "none"})`
+          : ""),
+    )
+    .join("; ");
+}
 
 function hasCompareAtPrice(compareAtPrice: string | null): boolean {
   return compareAtPrice !== null && Number(compareAtPrice) > 0;
@@ -154,6 +188,9 @@ export default function NewJob() {
   const isLoading = fetcher.state !== "idle";
   const preview = fetcher.data?.intent === "preview" ? fetcher.data.items : null;
   const skippedCount = fetcher.data?.intent === "preview" ? fetcher.data.skippedCount ?? 0 : 0;
+  const marketChanges = fetcher.data?.intent === "preview" ? fetcher.data.marketChanges ?? {} : {};
+  const marketChangeCount =
+    fetcher.data?.intent === "preview" ? fetcher.data.marketChangeCount ?? 0 : 0;
   const previewError = fetcher.data?.error;
 
   if (fetcher.data?.intent === "create" && fetcher.data.jobId) {
@@ -376,25 +413,40 @@ export default function NewJob() {
                 Preview ({preview.length} variant{preview.length === 1 ? "" : "s"})
               </Text>
               <DataTable
-                columnContentTypes={["text", "numeric", "numeric", "numeric", "numeric"]}
-                headings={["SKU", "Old price", "New price", "Old compare-at", "New compare-at"]}
-                rows={preview.slice(0, 100).map((item) => [
+                columnContentTypes={["text", "numeric", "numeric", "numeric", "numeric", "text"]}
+                headings={[
+                  "SKU",
+                  "Old price",
+                  "New price",
+                  "Old compare-at",
+                  "New compare-at",
+                  "Market fixed prices",
+                ]}
+                rows={preview.slice(0, PREVIEW_ROWS).map((item) => [
                   item.sku ?? "—",
                   item.oldPrice.toFixed(2),
                   item.newPrice.toFixed(2),
                   item.oldCompareAtPrice?.toFixed(2) ?? "—",
                   item.newCompareAtPrice?.toFixed(2) ?? "—",
+                  formatMarketChanges(marketChanges[item.variantId]),
                 ])}
               />
+              {marketChangeCount > 0 && (
+                <Text as="span" tone="subdued">
+                  Also changing {marketChangeCount} market fixed price
+                  {marketChangeCount === 1 ? "" : "s"} (e.g. UK prices in GBP), by the same
+                  proportion as the base price.
+                </Text>
+              )}
               {skippedCount > 0 && (
                 <Text as="span" tone="subdued">
                   Skipping {skippedCount} variant{skippedCount === 1 ? "" : "s"} that
                   already {skippedCount === 1 ? "has" : "have"} a compare-at price.
                 </Text>
               )}
-              {preview.length > 100 && (
+              {preview.length > PREVIEW_ROWS && (
                 <Text as="span" tone="subdued">
-                  Showing first 100 of {preview.length} variants.
+                  Showing first {PREVIEW_ROWS} of {preview.length} variants.
                 </Text>
               )}
             </BlockStack>

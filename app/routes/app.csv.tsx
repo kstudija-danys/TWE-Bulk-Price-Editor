@@ -75,6 +75,7 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<CsvAction
     filterValue: JSON.stringify({ rowCount: rows.length }),
     runAt: null,
     revertAt: null,
+    skipExistingCompareAt: false,
     items,
   });
 

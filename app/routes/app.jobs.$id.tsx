@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useFetcher, useLoaderData, useRevalidator } from "@remix-run/react";
 import {
   Page,
@@ -10,18 +10,24 @@ import {
   DataTable,
   Banner,
   ProgressBar,
+  Checkbox,
 } from "@shopify/polaris";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { isJobActiveInThisProcess, resumeJobInBackground, revertJob } from "../lib/jobs.server";
+import {
+  applyMissingMarketPricesInBackground,
+  isJobActiveInThisProcess,
+  resumeJobInBackground,
+  revertJob,
+} from "../lib/jobs.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
 
   const job = await prisma.priceJob.findFirst({
     where: { id: params.id, shopName: session.shop },
-    include: { items: true },
+    include: { items: { include: { marketPrices: true } } },
   });
 
   if (!job) throw new Response("Not found", { status: 404 });
@@ -43,6 +49,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       errorMessage: job.errorMessage,
       // "running" in the DB but not being worked on by the server: it was cut off.
       isStuck: job.status === "running" && !isJobActiveInThisProcess(job.id),
+      // Ran before market fixed prices (e.g. UK GBP) were supported.
+      needsMarketPrices: job.status === "completed" && !job.marketPricesRecorded,
+      skipExistingCompareAt: job.skipExistingCompareAt,
       items: job.items.map((i) => ({
         id: i.id,
         sku: i.sku,
@@ -52,6 +61,14 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         newCompareAtPrice: i.newCompareAtPrice?.toString() ?? null,
         status: i.status,
         errorMessage: i.errorMessage,
+        marketPrices: i.marketPrices.map((m) => ({
+          marketName: m.marketName,
+          currency: m.currency,
+          oldPrice: m.oldPrice.toString(),
+          newPrice: m.newPrice.toString(),
+          status: m.status,
+          errorMessage: m.errorMessage,
+        })),
       })),
     },
   };
@@ -59,7 +76,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 
 type RevertActionResponse = {
   ok: boolean;
-  intent?: "revert" | "resume";
+  intent?: "revert" | "resume" | "markets";
   result?: { succeeded: string[]; failed: { variantId: string; error: string }[] };
   error?: string;
 };
@@ -81,6 +98,22 @@ export const action = async ({
     console.log(`[resume] resuming job ${job.id}`);
     resumeJobInBackground(session.shop, job.id);
     return { ok: true, intent: "resume" };
+  }
+
+  if (formData.get("intent") === "markets") {
+    const job = await prisma.priceJob.findFirst({
+      where: { id: params.id, shopName: session.shop },
+    });
+    if (!job || job.status !== "completed" || job.marketPricesRecorded) {
+      return { ok: false, intent: "markets", error: "Market prices for this job are already handled." };
+    }
+    console.log(`[markets] applying missing market prices for job ${job.id}`);
+    applyMissingMarketPricesInBackground(
+      session.shop,
+      job.id,
+      formData.get("skipExistingCompareAt") === "true",
+    );
+    return { ok: true, intent: "markets" };
   }
 
   console.log(`[revert] POST received for job ${params.id}`);
@@ -118,11 +151,16 @@ export default function JobDetail() {
   // moment and then "running" until every variant has been processed.
   const isActive = job.status === "running" || (job.status === "draft" && !job.runAt);
   const isInProgress = isActive && !job.isStuck;
-  const processedCount = job.items.filter((i) => i.status !== "pending").length;
-  const errorCount = job.items.filter((i) => i.status === "error").length;
-  const progressPercent = job.items.length
-    ? Math.round((processedCount / job.items.length) * 100)
-    : 0;
+  const marketRows = job.items.flatMap((i) => i.marketPrices);
+  const totalCount = job.items.length + marketRows.length;
+  const processedCount =
+    job.items.filter((i) => i.status !== "pending").length +
+    marketRows.filter((m) => m.status !== "pending").length;
+  const errorCount =
+    job.items.filter((i) => i.status === "error").length +
+    marketRows.filter((m) => m.status === "error").length;
+  const progressPercent = totalCount ? Math.round((processedCount / totalCount) * 100) : 0;
+  const [skipMarketCompareAt, setSkipMarketCompareAt] = useState(true);
 
   // Keep refreshing while running; also while stuck, so the warning clears
   // as soon as a resume has picked the job up.
@@ -136,8 +174,10 @@ export default function JobDetail() {
 
   useEffect(() => {
     if (fetcher.state !== "idle" || !fetcher.data?.ok) return;
-    if (fetcher.data.intent === "resume") {
-      shopify.toast.show("Resuming job");
+    if (fetcher.data.intent === "resume" || fetcher.data.intent === "markets") {
+      shopify.toast.show(
+        fetcher.data.intent === "resume" ? "Resuming job" : "Updating market prices",
+      );
       revalidator.revalidate();
     } else {
       shopify.toast.show("Job reverted");
@@ -167,7 +207,8 @@ export default function JobDetail() {
               <BlockStack gap="100">
                 <ProgressBar progress={progressPercent} tone="primary" />
                 <Text as="p" tone="subdued">
-                  Updating prices… {processedCount} of {job.items.length} variants done
+                  Updating prices… {processedCount} of {totalCount} prices done
+                  {marketRows.length ? ` (incl. ${marketRows.length} market prices)` : ""}
                   {errorCount > 0 ? ` (${errorCount} failed)` : ""}. You can leave this
                   page — the job keeps running.
                 </Text>
@@ -189,6 +230,35 @@ export default function JobDetail() {
                 changed by someone else are skipped.
               </Banner>
             )}
+            {job.needsMarketPrices && (
+              <Banner
+                tone="warning"
+                title="Market prices weren't changed"
+                action={{
+                  content: "Update market prices",
+                  loading: isReverting,
+                  onAction: () =>
+                    fetcher.submit(
+                      { intent: "markets", skipExistingCompareAt: String(skipMarketCompareAt) },
+                      { method: "POST" },
+                    ),
+                }}
+              >
+                <BlockStack gap="200">
+                  <Text as="p">
+                    This job ran before the app handled markets with their own fixed prices
+                    (e.g. UK prices in GBP), so those markets still show the old prices. This
+                    applies the same change to them for every variant this job updated, and
+                    Revert will restore them too.
+                  </Text>
+                  <Checkbox
+                    label="Skip market prices that already have a compare-at price"
+                    checked={skipMarketCompareAt}
+                    onChange={setSkipMarketCompareAt}
+                  />
+                </BlockStack>
+              </Banner>
+            )}
             {job.errorMessage && <Banner tone="warning">{job.errorMessage}</Banner>}
             {fetcher.data && !fetcher.data.ok && (
               <Banner tone="critical">{fetcher.data.error}</Banner>
@@ -202,14 +272,30 @@ export default function JobDetail() {
               Variants ({job.items.length})
             </Text>
             <DataTable
-              columnContentTypes={["text", "numeric", "numeric", "numeric", "numeric", "text"]}
-              headings={["SKU", "Old price", "New price", "Old compare-at", "New compare-at", "Status"]}
+              columnContentTypes={["text", "numeric", "numeric", "numeric", "numeric", "text", "text"]}
+              headings={[
+                "SKU",
+                "Old price",
+                "New price",
+                "Old compare-at",
+                "New compare-at",
+                "Market fixed prices",
+                "Status",
+              ]}
               rows={job.items.map((item) => [
                 item.sku ?? "—",
                 Number(item.oldPrice).toFixed(2),
                 Number(item.newPrice).toFixed(2),
                 item.oldCompareAtPrice ? Number(item.oldCompareAtPrice).toFixed(2) : "—",
                 item.newCompareAtPrice ? Number(item.newCompareAtPrice).toFixed(2) : "—",
+                item.marketPrices.length
+                  ? item.marketPrices
+                      .map(
+                        (m) =>
+                          `${m.marketName}: ${Number(m.oldPrice).toFixed(2)} → ${Number(m.newPrice).toFixed(2)} ${m.currency} (${m.status})`,
+                      )
+                      .join("; ")
+                  : "—",
                 item.status,
               ])}
             />

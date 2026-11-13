@@ -516,13 +516,31 @@ export async function executeJob(admin: AdminGraphqlClient, jobId: string) {
  * the market fixed prices (e.g. UK GBP) of every variant the job updated, so
  * they match. Revert then restores them along with the base prices.
  */
+/**
+ * Whether a job can get its market prices applied after the fact: it ran
+ * before market prices were supported (or a previous attempt failed) and
+ * changed at least one variant. A "failed" status here comes from such a
+ * failed attempt, which used to mark the whole job as failed.
+ */
+export function canApplyMissingMarketPrices(
+  job: { status: string; marketPricesRecorded: boolean },
+  appliedItemCount: number,
+): boolean {
+  return (
+    !job.marketPricesRecorded &&
+    appliedItemCount > 0 &&
+    (job.status === "completed" || job.status === "failed")
+  );
+}
+
 export async function applyMissingMarketPrices(
   admin: AdminGraphqlClient,
   jobId: string,
   skipExistingCompareAt: boolean,
 ) {
   const job = await prisma.priceJob.findUnique({ where: { id: jobId }, include: { items: true } });
-  if (!job || job.status !== "completed" || job.marketPricesRecorded || activeJobIds.has(jobId)) {
+  const applied = job?.items.filter((i) => i.status === "applied") ?? [];
+  if (!job || !canApplyMissingMarketPrices(job, applied.length) || activeJobIds.has(jobId)) {
     return;
   }
 
@@ -532,17 +550,23 @@ export async function applyMissingMarketPrices(
       where: { id: jobId },
       data: { status: "running", skipExistingCompareAt },
     });
-    await ensureMarketRows(
-      admin,
-      jobId,
-      job.items.filter((i) => i.status === "applied"),
-    );
+    await ensureMarketRows(admin, jobId, applied);
     await applyMarketRows(admin, jobId, "applied");
     await finishJob(jobId);
-    return { succeeded: [], failed: [] };
+  } catch (error) {
+    // The base prices are already changed, so the job stays completed (and
+    // revertable); only the market step failed and can be retried.
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[jobs] market prices for job ${jobId} failed`, error);
+    await finishJob(jobId);
+    await prisma.priceJob.update({
+      where: { id: jobId },
+      data: { errorMessage: `Market prices couldn't be updated: ${message}` },
+    });
   } finally {
     activeJobIds.delete(jobId);
   }
+  return { succeeded: [], failed: [] };
 }
 
 export function applyMissingMarketPricesInBackground(

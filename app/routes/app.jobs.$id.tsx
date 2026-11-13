@@ -17,6 +17,7 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import {
   applyMissingMarketPricesInBackground,
+  canApplyMissingMarketPrices,
   isJobActiveInThisProcess,
   resumeJobInBackground,
   revertJob,
@@ -50,7 +51,10 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       // "running" in the DB but not being worked on by the server: it was cut off.
       isStuck: job.status === "running" && !isJobActiveInThisProcess(job.id),
       // Ran before market fixed prices (e.g. UK GBP) were supported.
-      needsMarketPrices: job.status === "completed" && !job.marketPricesRecorded,
+      needsMarketPrices: canApplyMissingMarketPrices(
+        job,
+        job.items.filter((i) => i.status === "applied").length,
+      ),
       skipExistingCompareAt: job.skipExistingCompareAt,
       items: job.items.map((i) => ({
         id: i.id,
@@ -103,8 +107,9 @@ export const action = async ({
   if (formData.get("intent") === "markets") {
     const job = await prisma.priceJob.findFirst({
       where: { id: params.id, shopName: session.shop },
+      include: { items: { where: { status: "applied" }, select: { id: true } } },
     });
-    if (!job || job.status !== "completed" || job.marketPricesRecorded) {
+    if (!job || !canApplyMissingMarketPrices(job, job.items.length)) {
       return { ok: false, intent: "markets", error: "Market prices for this job are already handled." };
     }
     console.log(`[markets] applying missing market prices for job ${job.id}`);

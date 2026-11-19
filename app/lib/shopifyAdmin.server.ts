@@ -150,25 +150,122 @@ export type ResolvedVariant = {
   sku: string | null;
   price: string;
   compareAtPrice: string | null;
+  variantTitle: string;
+  productTitle: string;
+  /** ACTIVE / DRAFT / ARCHIVED */
+  productStatus: string;
+  tags: string[];
+  vendor: string;
+  productType: string;
+  /** Only fetched when a stock filter needs it; null otherwise. */
+  inventoryQuantity: number | null;
 };
 
-const VARIANT_FRAGMENT = `
+const PRODUCT_FIELDS = `
   id
+  title
+  status
+  tags
+  vendor
+  productType
+`;
+
+// inventoryQuantity is only requested when a stock filter is used.
+const VARIANT_FIELDS = `
+  id
+  title
   price
   compareAtPrice
   sku
+  inventoryQuantity @include(if: $withInventory)
+`;
+
+const VARIANT_FRAGMENT = `
+  ${VARIANT_FIELDS}
   product {
-    id
+    ${PRODUCT_FIELDS}
   }
 `;
 
+type ProductNode = {
+  id: string;
+  title: string;
+  status: string;
+  tags: string[];
+  vendor: string;
+  productType: string;
+};
+
+type VariantNode = {
+  id: string;
+  title: string;
+  price: string;
+  compareAtPrice: string | null;
+  sku: string | null;
+  inventoryQuantity?: number | null;
+};
+
+function toResolved(v: VariantNode, product: ProductNode): ResolvedVariant {
+  return {
+    variantId: v.id,
+    productId: product.id,
+    sku: v.sku,
+    price: v.price,
+    compareAtPrice: v.compareAtPrice,
+    variantTitle: v.title,
+    productTitle: product.title,
+    productStatus: product.status,
+    tags: product.tags ?? [],
+    vendor: product.vendor ?? "",
+    productType: product.productType ?? "",
+    inventoryQuantity: v.inventoryQuantity ?? null,
+  };
+}
+
+/** Fetches the variants after the first page, for products with more than 100. */
+async function fetchRemainingVariants(
+  admin: AdminGraphqlClient,
+  productId: string,
+  after: string,
+  withInventory: boolean,
+): Promise<VariantNode[]> {
+  const out: VariantNode[] = [];
+  let cursor: string | null = after;
+  while (cursor) {
+    const json = await graphqlWithRetry(
+      admin,
+      `#graphql
+      query bulkPriceEditorMoreVariants($id: ID!, $after: String, $withInventory: Boolean!) {
+        product(id: $id) {
+          variants(first: 100, after: $after) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              ${VARIANT_FIELDS}
+            }
+          }
+        }
+      }`,
+      { id: productId, after: cursor, withInventory },
+    );
+    const variants = json.data?.product?.variants;
+    out.push(...(variants?.nodes ?? []));
+    cursor = variants?.pageInfo?.hasNextPage ? variants.pageInfo.endCursor : null;
+  }
+  return out;
+}
+
 /**
  * Resolves all variants matching a Shopify product search query
- * (e.g. "tag:'sale'", "vendor:'Nike'", "collection_id:123").
+ * (e.g. "tag:'sale'", "vendor:'Nike'", "collection_id:123"). An empty query
+ * matches every product.
  */
 export async function resolveVariantsByQuery(
   admin: AdminGraphqlClient,
   searchQuery: string,
+  withInventory = false,
 ): Promise<ResolvedVariant[]> {
   const results: ResolvedVariant[] = [];
   let after: string | null = null;
@@ -178,40 +275,43 @@ export async function resolveVariantsByQuery(
     const json = await graphqlWithRetry(
       admin,
       `#graphql
-      query bulkPriceEditorProducts($query: String!, $after: String) {
+      query bulkPriceEditorProducts($query: String!, $after: String, $withInventory: Boolean!) {
         products(first: 50, after: $after, query: $query) {
           pageInfo {
             hasNextPage
             endCursor
           }
-          edges {
-            node {
-              variants(first: 100) {
-                edges {
-                  node {
-                    ${VARIANT_FRAGMENT}
-                  }
-                }
+          nodes {
+            ${PRODUCT_FIELDS}
+            variants(first: 100) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              nodes {
+                ${VARIANT_FIELDS}
               }
             }
           }
         }
       }`,
-      { query: searchQuery, after },
+      { query: searchQuery, after, withInventory },
     );
 
     const products = json.data?.products;
-    for (const productEdge of products?.edges ?? []) {
-      for (const variantEdge of productEdge.node.variants.edges) {
-        const v = variantEdge.node;
-        results.push({
-          variantId: v.id,
-          productId: v.product.id,
-          sku: v.sku,
-          price: v.price,
-          compareAtPrice: v.compareAtPrice,
-        });
+    for (const product of products?.nodes ?? []) {
+      const variants: VariantNode[] = [...product.variants.nodes];
+      if (product.variants.pageInfo?.hasNextPage) {
+        variants.push(
+          ...(await fetchRemainingVariants(
+            admin,
+            product.id,
+            product.variants.pageInfo.endCursor,
+            withInventory,
+          )),
+        );
       }
+      for (const v of variants) results.push(toResolved(v, product));
     }
 
     hasNextPage = products?.pageInfo?.hasNextPage ?? false;
@@ -225,6 +325,7 @@ export async function resolveVariantsByQuery(
 export async function resolveVariantsByIds(
   admin: AdminGraphqlClient,
   variantIds: string[],
+  withInventory = false,
 ): Promise<ResolvedVariant[]> {
   const results: ResolvedVariant[] = [];
 
@@ -232,29 +333,99 @@ export async function resolveVariantsByIds(
     const json = await graphqlWithRetry(
       admin,
       `#graphql
-      query bulkPriceEditorVariantsByIds($ids: [ID!]!) {
+      query bulkPriceEditorVariantsByIds($ids: [ID!]!, $withInventory: Boolean!) {
         nodes(ids: $ids) {
           ... on ProductVariant {
             ${VARIANT_FRAGMENT}
           }
         }
       }`,
-      { ids: batch },
+      { ids: batch, withInventory },
     );
 
     for (const node of json.data?.nodes ?? []) {
-      if (!node) continue;
-      results.push({
-        variantId: node.id,
-        productId: node.product.id,
-        sku: node.sku,
-        price: node.price,
-        compareAtPrice: node.compareAtPrice,
-      });
+      if (!node?.product) continue;
+      results.push(toResolved(node, node.product));
     }
   }
 
   return results;
+}
+
+/** The ids of every product in any of the given collections. */
+export async function fetchProductIdsInCollections(
+  admin: AdminGraphqlClient,
+  collectionIds: string[],
+): Promise<Set<string>> {
+  const ids = new Set<string>();
+  if (collectionIds.length === 0) return ids;
+  const query = collectionIds
+    .map((c) => `collection_id:${c.includes("/") ? c.split("/").pop() : c}`)
+    .join(" OR ");
+
+  let after: string | null = null;
+  let hasNextPage = true;
+  while (hasNextPage) {
+    const json = await graphqlWithRetry(
+      admin,
+      `#graphql
+      query bulkPriceEditorProductIds($query: String!, $after: String) {
+        products(first: 250, after: $after, query: $query) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            id
+          }
+        }
+      }`,
+      { query, after },
+    );
+    const products = json.data?.products;
+    for (const p of products?.nodes ?? []) ids.add(p.id);
+    hasNextPage = products?.pageInfo?.hasNextPage ?? false;
+    after = products?.pageInfo?.endCursor ?? null;
+  }
+  return ids;
+}
+
+export type ProductFacets = { tags: string[]; vendors: string[]; productTypes: string[] };
+
+/** Every product tag, vendor and product type in the store, for the filter pickers. */
+export async function fetchProductFacets(admin: AdminGraphqlClient): Promise<ProductFacets> {
+  const facets: ProductFacets = { tags: [], vendors: [], productTypes: [] };
+  const fields = [
+    ["productTags", "tags"],
+    ["productVendors", "vendors"],
+    ["productTypes", "productTypes"],
+  ] as const;
+
+  for (const [field, key] of fields) {
+    let after: string | null = null;
+    // Capped so a store with a huge number of tags can't stall the page.
+    for (let page = 0; page < 20; page++) {
+      const json = await graphqlWithRetry(
+        admin,
+        `#graphql
+        query bulkPriceEditorFacets($after: String) {
+          ${field}(first: 250, after: $after) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes
+          }
+        }`,
+        { after },
+      );
+      const conn = json.data?.[field];
+      facets[key].push(...((conn?.nodes ?? []) as string[]).filter(Boolean));
+      if (!conn?.pageInfo?.hasNextPage) break;
+      after = conn.pageInfo.endCursor;
+    }
+  }
+  return facets;
 }
 
 /** Resolves variants by SKU (used by CSV import when variant_id isn't supplied). */
@@ -269,7 +440,7 @@ export async function resolveVariantsBySkus(
     const json = await graphqlWithRetry(
       admin,
       `#graphql
-      query bulkPriceEditorVariantsBySku($query: String!) {
+      query bulkPriceEditorVariantsBySku($query: String!, $withInventory: Boolean!) {
         productVariants(first: 100, query: $query) {
           edges {
             node {
@@ -278,18 +449,11 @@ export async function resolveVariantsBySkus(
           }
         }
       }`,
-      { query: searchQuery },
+      { query: searchQuery, withInventory: false },
     );
 
     for (const edge of json.data?.productVariants?.edges ?? []) {
-      const v = edge.node;
-      results.push({
-        variantId: v.id,
-        productId: v.product.id,
-        sku: v.sku,
-        price: v.price,
-        compareAtPrice: v.compareAtPrice,
-      });
+      results.push(toResolved(edge.node, edge.node.product));
     }
   }
 

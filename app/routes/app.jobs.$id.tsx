@@ -19,9 +19,11 @@ import {
   applyMissingMarketPricesInBackground,
   canApplyMissingMarketPrices,
   isJobActiveInThisProcess,
+  pricingOptionsOf,
   resumeJobInBackground,
   revertJob,
 } from "../lib/jobs.server";
+import { describeAdvancedFilter } from "../lib/filters";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -43,6 +45,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       filterType: job.filterType,
       filterValue: job.filterValue,
       value: job.value?.toString() ?? null,
+      options: pricingOptionsOf(job),
+      filterSummary:
+        job.filterType === "advanced" && job.filterValue
+          ? describeAdvancedFilter(job.filterValue)
+          : null,
       runAt: job.runAt?.toISOString() ?? null,
       revertAt: job.revertAt?.toISOString() ?? null,
       createdAt: job.createdAt.toISOString(),
@@ -317,9 +324,14 @@ function InlineSummary({ job }: { job: ReturnType<typeof useLoaderData<typeof lo
       <Text as="p">
         <Badge tone={STATUS_TONE[job.status]}>{job.status}</Badge>
       </Text>
+      <Text as="p">{describeRule(job)}</Text>
+      {job.filterSummary && (
+        <Text as="p" tone="subdued">
+          Products: {job.filterSummary}
+        </Text>
+      )}
       <Text as="p" tone="subdued">
-        {job.mode} / {job.targetField} · value: {job.value} · created{" "}
-        {new Date(job.createdAt).toLocaleString()}
+        Created {new Date(job.createdAt).toLocaleString()}
       </Text>
       {job.runAt && (
         <Text as="p" tone="subdued">
@@ -333,4 +345,48 @@ function InlineSummary({ job }: { job: ReturnType<typeof useLoaderData<typeof lo
       )}
     </BlockStack>
   );
+}
+
+const TARGET_LABEL: Record<string, string> = {
+  price: "price",
+  compareAtPrice: "compare-at price",
+  both: "price and compare-at price",
+};
+
+const ROUNDING_LABEL: Record<string, string> = {
+  "99": "rounded to .99",
+  "95": "rounded to .95",
+  "00": "rounded to whole numbers",
+  "5": "rounded to the nearest 5",
+};
+
+function describeRule(job: ReturnType<typeof useLoaderData<typeof loader>>["job"]): string {
+  const v = Number(job.value);
+  const target = TARGET_LABEL[job.targetField] ?? job.targetField;
+  let rule: string;
+  switch (job.mode) {
+    case "percent":
+      rule = `${v > 0 ? "+" : ""}${v}% on ${target}`;
+      break;
+    case "fixed":
+      rule = `${v > 0 ? "+" : ""}${v.toFixed(2)} on ${target}`;
+      break;
+    case "setvalue":
+      rule = `Set ${target} to ${v.toFixed(2)}`;
+      break;
+    case "compareAtMarkup":
+      rule = `Compare-at = price + ${v}%`;
+      break;
+    default:
+      rule = "Prices from CSV upload";
+  }
+  const extras = [
+    ROUNDING_LABEL[job.options.rounding],
+    job.options.minPrice !== null ? `never below ${job.options.minPrice.toFixed(2)}` : null,
+    job.options.maxDiscountPercent !== null
+      ? `max ${job.options.maxDiscountPercent}% off`
+      : null,
+    job.skipExistingCompareAt ? "skipping variants already on sale" : null,
+  ].filter(Boolean);
+  return extras.length ? `${rule} (${extras.join(", ")})` : rule;
 }

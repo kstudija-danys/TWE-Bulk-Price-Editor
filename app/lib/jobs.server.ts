@@ -6,6 +6,7 @@ import {
   fetchMarketFixedPrices,
   type MarketFixedPrice,
   type BatchResult,
+  fetchProductIdsInCollections,
   resolveVariantsByIds,
   resolveVariantsByQuery,
   type ResolvedVariant,
@@ -13,9 +14,19 @@ import {
 import {
   computeMarketPrices,
   computeUpdatedPrices,
+  DEFAULT_PRICING_OPTIONS,
+  ROUNDINGS,
   type JobMode,
   type JobTargetField,
+  type PricingOptions,
+  type Rounding,
 } from "./pricing";
+import {
+  applyVariantFilters,
+  buildProductSearchQuery,
+  parseAdvancedFilter,
+  SYNC_INTERVAL_MINUTES,
+} from "./filters";
 import type { JobFilterType } from "@prisma/client";
 
 type AdminGraphqlClient = Parameters<typeof resolveVariantsByQuery>[0];
@@ -24,6 +35,9 @@ export type JobItemPreview = {
   variantId: string;
   productId: string;
   sku: string | null;
+  /** For display in the preview only (not stored). */
+  productTitle?: string;
+  variantTitle?: string;
   oldPrice: number;
   newPrice: number;
   oldCompareAtPrice: number | null;
@@ -45,7 +59,22 @@ type PriceRule = {
   targetField: JobTargetField;
   value: number;
   skipExistingCompareAt: boolean;
+  options: PricingOptions;
 };
+
+/** Reads a job's stored pricing options (rounding and guardrails). */
+export function pricingOptionsOf(job: {
+  rounding: string | null;
+  minPrice: { toString(): string } | null;
+  maxDiscountPercent: { toString(): string } | null;
+}): PricingOptions {
+  return {
+    rounding: ROUNDINGS.includes(job.rounding as Rounding) ? (job.rounding as Rounding) : "none",
+    minPrice: job.minPrice !== null ? Number(job.minPrice.toString()) : null,
+    maxDiscountPercent:
+      job.maxDiscountPercent !== null ? Number(job.maxDiscountPercent.toString()) : null,
+  };
+}
 
 type BasePriceChange = {
   variantId: string;
@@ -85,6 +114,7 @@ function computeMarketChanges(
         newCompareAtPrice: item.newCompareAtPrice,
         fixedPrice,
         fixedCompareAtPrice,
+        options: rule.options,
       });
       changes.push({
         priceListId: fixed.priceListId,
@@ -114,50 +144,20 @@ export async function previewMarketChanges(
   return Object.fromEntries(computeMarketChanges(rule, items, fixed));
 }
 
-export type AdvancedFilter = {
-  combinator: "AND" | "OR";
-  tags: string[];
-  vendors: string[];
-  productTypes: string[];
-  collectionIds: string[];
-};
-
-function escapeQueryValue(value: string): string {
-  return value.replace(/'/g, "");
-}
-
 function searchQueryForFilter(filterType: JobFilterType, filterValue: string): string {
+  const quoted = filterValue.replace(/['"\\]/g, "");
   switch (filterType) {
     case "collection":
       return `collection_id:${filterValue}`;
     case "tag":
-      return `tag:'${escapeQueryValue(filterValue)}'`;
+      return `tag:'${quoted}'`;
     case "vendor":
-      return `vendor:'${escapeQueryValue(filterValue)}'`;
+      return `vendor:'${quoted}'`;
     case "productType":
-      return `product_type:'${escapeQueryValue(filterValue)}'`;
+      return `product_type:'${quoted}'`;
     default:
       throw new Error(`searchQueryForFilter does not support filterType ${filterType}`);
   }
-}
-
-function searchQueryForAdvancedFilter(filterValue: string): string {
-  const filter: AdvancedFilter = JSON.parse(filterValue);
-  const clauses = [
-    ...filter.tags.map((t) => `tag:'${escapeQueryValue(t)}'`),
-    ...filter.vendors.map((v) => `vendor:'${escapeQueryValue(v)}'`),
-    ...filter.productTypes.map((p) => `product_type:'${escapeQueryValue(p)}'`),
-    ...filter.collectionIds.map((c) => {
-      const numericId = c.includes("/") ? c.split("/").pop() : c;
-      return `collection_id:${numericId}`;
-    }),
-  ];
-
-  if (clauses.length === 0) {
-    throw new Error("Add at least one tag, vendor, product type, or collection to filter by.");
-  }
-
-  return clauses.join(filter.combinator === "AND" ? " AND " : " OR ");
 }
 
 /** Resolves the variant set for a non-CSV job (collection/tag/vendor/productType/advanced/manual). */
@@ -174,7 +174,12 @@ export async function resolveJobVariants(
     throw new Error("CSV jobs build their item list directly, not via resolveJobVariants");
   }
   if (filterType === "advanced") {
-    return resolveVariantsByQuery(admin, searchQueryForAdvancedFilter(filterValue));
+    const filter = parseAdvancedFilter(filterValue);
+    const [variants, excludedProductIds] = await Promise.all([
+      resolveVariantsByQuery(admin, buildProductSearchQuery(filter), filter.stock !== "any"),
+      fetchProductIdsInCollections(admin, filter.exclude.collectionIds),
+    ]);
+    return applyVariantFilters(variants, filter, excludedProductIds);
   }
   return resolveVariantsByQuery(admin, searchQueryForFilter(filterType, filterValue));
 }
@@ -184,9 +189,11 @@ export function buildPreview(params: {
   mode: JobMode;
   targetField: JobTargetField;
   value: number;
+  options?: PricingOptions;
   variants: ResolvedVariant[];
 }): JobItemPreview[] {
   const { mode, targetField, value, variants } = params;
+  const options = params.options ?? DEFAULT_PRICING_OPTIONS;
 
   return variants.map((v) => {
     const oldPrice = Number(v.price);
@@ -197,12 +204,15 @@ export function buildPreview(params: {
       value,
       oldPrice,
       oldCompareAtPrice,
+      options,
     });
 
     return {
       variantId: v.variantId,
       productId: v.productId,
       sku: v.sku,
+      productTitle: v.productTitle,
+      variantTitle: v.variantTitle,
       oldPrice,
       newPrice,
       oldCompareAtPrice,
@@ -222,6 +232,8 @@ export async function createJob(params: {
   runAt: Date | null;
   revertAt: Date | null;
   skipExistingCompareAt: boolean;
+  options?: PricingOptions;
+  autoApplyNewProducts?: boolean;
   items: JobItemPreview[];
 }) {
   const {
@@ -237,6 +249,7 @@ export async function createJob(params: {
     skipExistingCompareAt,
     items,
   } = params;
+  const options = params.options ?? DEFAULT_PRICING_OPTIONS;
 
   return prisma.priceJob.create({
     data: {
@@ -250,6 +263,10 @@ export async function createJob(params: {
       runAt,
       revertAt,
       skipExistingCompareAt,
+      rounding: options.rounding === "none" ? null : options.rounding,
+      minPrice: options.minPrice,
+      maxDiscountPercent: options.maxDiscountPercent,
+      autoApplyNewProducts: params.autoApplyNewProducts ?? false,
       status: runAt && runAt.getTime() > Date.now() ? "scheduled" : "draft",
       items: {
         create: items.map((item) => ({
@@ -349,12 +366,26 @@ type JobItemRow = Awaited<ReturnType<typeof prisma.priceJobItem.findMany>>[numbe
 async function ensureMarketRows(admin: AdminGraphqlClient, jobId: string, items: JobItemRow[]) {
   const job = await prisma.priceJob.findUniqueOrThrow({ where: { id: jobId } });
   if (job.marketPricesRecorded) return;
+  await recordMarketRows(admin, job, items);
+}
+
+/**
+ * Reads the given items' current market fixed prices and records them with
+ * their new values, then marks the job's market prices as recorded.
+ */
+async function recordMarketRows(
+  admin: AdminGraphqlClient,
+  job: Awaited<ReturnType<typeof prisma.priceJob.findUniqueOrThrow>>,
+  items: JobItemRow[],
+) {
+  const jobId = job.id;
 
   const rule: PriceRule = {
     mode: job.mode,
     targetField: job.targetField,
     value: job.value !== null ? Number(job.value) : 0,
     skipExistingCompareAt: job.skipExistingCompareAt,
+    options: pricingOptionsOf(job),
   };
   const base: BasePriceChange[] = items.map((i) => ({
     variantId: i.variantId,
@@ -744,4 +775,159 @@ export async function revertJob(admin: AdminGraphqlClient, jobId: string) {
   ]);
 
   return { succeeded, failed };
+}
+
+// ---------------------------------------------------------------------------
+// Applying a finished job to products that match its filter later
+//
+// e.g. a Black Friday job ran on everything tagged "black-month", then more
+// products got that tag: these find those products and give them the same
+// change, as part of the same job (so Revert and auto-revert cover them too).
+// ---------------------------------------------------------------------------
+
+
+type SyncableJob = {
+  status: string;
+  filterType: JobFilterType;
+  revertAt: Date | null;
+};
+
+/** Whether a job can be applied to newly matching products. */
+export function canApplyToNewProducts(job: SyncableJob): boolean {
+  return (
+    job.status === "completed" &&
+    job.filterType !== "manual" &&
+    job.filterType !== "csv" &&
+    (job.revertAt === null || job.revertAt.getTime() > Date.now())
+  );
+}
+
+/**
+ * The variants that match a completed job's filter now but aren't part of
+ * the job yet, with the job's rule applied. Skips variants in a job that is
+ * running right now, and (if the job does) variants already on sale.
+ */
+export async function findNewMatches(
+  admin: AdminGraphqlClient,
+  jobId: string,
+): Promise<JobItemPreview[]> {
+  const job = await prisma.priceJob.findUniqueOrThrow({ where: { id: jobId } });
+  if (!canApplyToNewProducts(job) || !job.filterValue) return [];
+
+  const [matches, existing, busy] = await Promise.all([
+    resolveJobVariants(admin, job.filterType, job.filterValue),
+    prisma.priceJobItem.findMany({ where: { jobId }, select: { variantId: true } }),
+    prisma.priceJobItem.findMany({
+      where: { job: { status: "running", id: { not: jobId }, shopName: job.shopName } },
+      select: { variantId: true },
+    }),
+  ]);
+  const skip = new Set([...existing, ...busy].map((i) => i.variantId));
+  const variants = matches.filter(
+    (v) =>
+      !skip.has(v.variantId) &&
+      !(job.skipExistingCompareAt && v.compareAtPrice !== null && Number(v.compareAtPrice) > 0),
+  );
+
+  return buildPreview({
+    mode: job.mode,
+    targetField: job.targetField,
+    value: job.value !== null ? Number(job.value) : 0,
+    options: pricingOptionsOf(job),
+    variants,
+  });
+}
+
+/**
+ * Adds the newly matching variants to a completed job and applies the job's
+ * change to them (and their market fixed prices). Returns how many were added.
+ */
+export async function applyToNewProducts(admin: AdminGraphqlClient, jobId: string) {
+  if (activeJobIds.has(jobId)) return { succeeded: [], failed: [] };
+  activeJobIds.add(jobId);
+  try {
+    const newItems = await findNewMatches(admin, jobId);
+    await prisma.priceJob.update({ where: { id: jobId }, data: { lastSyncedAt: new Date() } });
+    if (newItems.length === 0) return { succeeded: [], failed: [] };
+
+    const job = await prisma.priceJob.findUniqueOrThrow({ where: { id: jobId } });
+    // Re-check: the job may have been reverted while we were looking.
+    if (job.status !== "completed") return { succeeded: [], failed: [] };
+
+    await prisma.$transaction([
+      prisma.priceJobItem.createMany({
+        data: newItems.map((item) => ({
+          jobId,
+          variantId: item.variantId,
+          productId: item.productId,
+          sku: item.sku,
+          oldPrice: item.oldPrice,
+          newPrice: item.newPrice,
+          oldCompareAtPrice: item.oldCompareAtPrice,
+          newCompareAtPrice: item.newCompareAtPrice,
+        })),
+      }),
+      prisma.priceJob.update({ where: { id: jobId }, data: { status: "running" } }),
+    ]);
+    const rows = await prisma.priceJobItem.findMany({
+      where: { jobId, status: "pending", variantId: { in: newItems.map((i) => i.variantId) } },
+    });
+    console.log(`[jobs] job ${jobId}: applying to ${rows.length} newly matching variants`);
+
+    // Jobs that never recorded market prices get them later via the
+    // "Update market prices" banner, which covers these items too.
+    if (job.marketPricesRecorded) await recordMarketRows(admin, job, rows);
+    return await applyItemsAndFinish(admin, jobId, rows);
+  } finally {
+    activeJobIds.delete(jobId);
+  }
+}
+
+/**
+ * Runs applyToNewProducts without waiting. Unlike other background runs, a
+ * crash here must not mark the job failed: its original prices are applied
+ * and must stay revertable. The job's status is recomputed from its items.
+ */
+export function applyToNewProductsInBackground(shopName: string, jobId: string) {
+  void (async () => {
+    try {
+      const { admin } = await unauthenticated.admin(shopName);
+      const result = await applyToNewProducts(admin, jobId);
+      if (result.succeeded.length || result.failed.length) {
+        console.log(
+          `[jobs] job ${jobId} new products: ${result.succeeded.length} applied, ${result.failed.length} failed`,
+        );
+      }
+    } catch (error) {
+      console.error(`[jobs] applying job ${jobId} to new products failed`, error);
+      try {
+        const job = await prisma.priceJob.findUnique({ where: { id: jobId } });
+        if (job?.status === "running") await finishJob(jobId);
+        await prisma.priceJob.update({
+          where: { id: jobId },
+          data: {
+            errorMessage: `Couldn't apply to new products: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          },
+        });
+      } catch (e) {
+        console.error(`[jobs] could not record sync failure for job ${jobId}`, e);
+      }
+    }
+  })();
+}
+
+/** Every auto-apply job due for a check for new products, across all shops. */
+export async function dueAutoApplyJobs() {
+  const cutoff = new Date(Date.now() - SYNC_INTERVAL_MINUTES * 60_000);
+  const jobs = await prisma.priceJob.findMany({
+    where: {
+      autoApplyNewProducts: true,
+      status: "completed",
+      OR: [{ lastSyncedAt: null }, { lastSyncedAt: { lte: cutoff } }],
+    },
+    select: { id: true, shopName: true, status: true, filterType: true, revertAt: true },
+  });
+  return jobs.filter(canApplyToNewProducts);
 }

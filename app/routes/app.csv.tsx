@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ActionFunctionArgs } from "@remix-run/node";
 import { useFetcher, useNavigate } from "@remix-run/react";
 import { Page, Card, BlockStack, Text, DropZone, Button, Banner, DataTable } from "@shopify/polaris";
@@ -6,7 +6,7 @@ import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import Papa from "papaparse";
 import { authenticate } from "../shopify.server";
 import { resolveVariantsByIds, resolveVariantsBySkus } from "../lib/shopifyAdmin.server";
-import { createJob, executeJob } from "../lib/jobs.server";
+import { createJob, executeJobInBackground } from "../lib/jobs.server";
 
 type CsvRow = {
   variant_id?: string;
@@ -79,7 +79,8 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<CsvAction
     items,
   });
 
-  await executeJob(admin, job.id);
+  // Don't wait: big CSVs would time out the request. The job page shows progress.
+  executeJobInBackground(session.shop, job.id);
 
   return { jobId: job.id, unmatched };
 };
@@ -91,10 +92,17 @@ export default function CsvUpload() {
   const [rows, setRows] = useState<CsvRow[]>([]);
   const [parseError, setParseError] = useState<string | null>(null);
 
-  if (fetcher.data?.jobId) {
-    shopify.toast.show("CSV price change applied");
-    navigate(`/app/jobs/${fetcher.data.jobId}`);
-  }
+  const jobId = fetcher.data?.jobId;
+  const unmatchedCount = fetcher.data?.unmatched?.length ?? 0;
+  useEffect(() => {
+    if (!jobId) return;
+    shopify.toast.show(
+      unmatchedCount
+        ? `CSV price change started (${unmatchedCount} row(s) didn't match a variant)`
+        : "CSV price change started",
+    );
+    navigate(`/app/jobs/${jobId}`);
+  }, [jobId, unmatchedCount, navigate, shopify]);
 
   function handleDrop(_dropFiles: File[], acceptedFiles: File[]) {
     const file = acceptedFiles[0];

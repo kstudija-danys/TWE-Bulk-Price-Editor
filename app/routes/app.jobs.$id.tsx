@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { useEffect, useState } from "react";
-import { useFetcher, useLoaderData, useRevalidator } from "@remix-run/react";
+import { useFetcher, useLoaderData, useNavigate, useRevalidator } from "@remix-run/react";
 import {
   Page,
   Card,
@@ -22,7 +22,9 @@ import {
   applyToNewProductsInBackground,
   canApplyMissingMarketPrices,
   canApplyToNewProducts,
+  countSkippedItems,
   findNewMatches,
+  revertSkippedItemsInBackground,
   isJobActiveInThisProcess,
   pricingOptionsOf,
   resumeJobInBackground,
@@ -71,9 +73,15 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       canApplyToNewProducts: canApplyToNewProducts(job),
       autoApplyNewProducts: job.autoApplyNewProducts,
       lastSyncedAt: job.lastSyncedAt?.toISOString() ?? null,
+      saleTag: job.saleTag,
+      // e.g. putting skipped prices back, or applying to new products.
+      isBusy: isJobActiveInThisProcess(job.id),
+      skippedCount: job.status === "reverted" ? await countSkippedItems(job.id) : 0,
+      canDuplicate: job.mode !== "csv" && (job.filterType === "advanced" || job.filterType === "manual"),
       items: job.items.map((i) => ({
         id: i.id,
         sku: i.sku,
+        productTitle: i.productTitle,
         oldPrice: i.oldPrice.toString(),
         newPrice: i.newPrice.toString(),
         oldCompareAtPrice: i.oldCompareAtPrice?.toString() ?? null,
@@ -103,7 +111,7 @@ type NewMatchRow = {
 
 type RevertActionResponse = {
   ok: boolean;
-  intent?: "revert" | "resume" | "markets" | "findNew" | "applyNew" | "autoApply";
+  intent?: "revert" | "resume" | "markets" | "findNew" | "applyNew" | "autoApply" | "forceRevert";
   result?: { succeeded: string[]; failed: { variantId: string; error: string }[] };
   newMatches?: { count: number; rows: NewMatchRow[] };
   error?: string;
@@ -131,6 +139,22 @@ export const action = async ({
   }
 
   const intent = formData.get("intent");
+  if (intent === "forceRevert") {
+    const job = await prisma.priceJob.findFirst({
+      where: { id: params.id, shopName: session.shop },
+    });
+    if (job && isJobActiveInThisProcess(job.id)) {
+      return { ok: false, intent, error: "Still working on it — this page updates when it's done." };
+    }
+    if (!job || job.status !== "reverted") {
+      return { ok: false, intent, error: "Only a reverted job's skipped prices can be put back." };
+    }
+    if (!revertSkippedItemsInBackground(session.shop, job.id)) {
+      return { ok: false, intent, error: "Still working on it — this page updates when it's done." };
+    }
+    return { ok: true, intent };
+  }
+
   if (intent === "findNew" || intent === "applyNew" || intent === "autoApply") {
     const job = await prisma.priceJob.findFirst({
       where: { id: params.id, shopName: session.shop },
@@ -224,6 +248,7 @@ const STATUS_TONE: Record<string, "info" | "success" | "critical" | "warning" | 
 
 export default function JobDetail() {
   const { job } = useLoaderData<typeof loader>();
+  const navigate = useNavigate();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
 
@@ -250,18 +275,21 @@ export default function JobDetail() {
   // Keep refreshing while running; also while stuck, so the warning clears
   // as soon as a resume has picked the job up.
   useEffect(() => {
-    if (!isActive) return;
+    if (!isActive && !job.isBusy) return;
     const timer = setInterval(() => {
       if (revalidator.state === "idle") revalidator.revalidate();
     }, 3000);
     return () => clearInterval(timer);
-  }, [isActive, revalidator]);
+  }, [isActive, job.isBusy, revalidator]);
 
   useEffect(() => {
     if (fetcher.state !== "idle" || !fetcher.data?.ok) return;
     const { intent } = fetcher.data;
     if (intent === "findNew") return;
-    if (intent === "applyNew" || intent === "autoApply") {
+    if (intent === "forceRevert") {
+      shopify.toast.show("Putting skipped prices back");
+      revalidator.revalidate();
+    } else if (intent === "applyNew" || intent === "autoApply") {
       shopify.toast.show(
         intent === "applyNew" ? "Applying to new products" : "Auto-apply setting saved",
       );
@@ -278,6 +306,9 @@ export default function JobDetail() {
   return (
     <Page>
       <TitleBar title={job.name || `Price change — ${job.filterType}`}>
+        {job.canDuplicate && (
+          <button onClick={() => navigate(`/app/jobs/new?from=${job.id}`)}>Duplicate</button>
+        )}
         {canRevert && (
           <button
             variant="primary"
@@ -350,6 +381,23 @@ export default function JobDetail() {
               </Banner>
             )}
             {job.errorMessage && <Banner tone="warning">{job.errorMessage}</Banner>}
+            {job.status === "reverted" && job.skippedCount > 0 && (
+              <Banner
+                tone="warning"
+                title={`${job.skippedCount} price(s) weren't put back`}
+                action={{
+                  content: job.isBusy ? "Putting them back…" : "Put them back anyway",
+                  loading: isReverting || job.isBusy,
+                  disabled: job.isBusy,
+                  onAction: () => fetcher.submit({ intent: "forceRevert" }, { method: "POST" }),
+                }}
+              >
+                Their price had changed after this job set it — usually by a newer price
+                change or a manual edit — so Revert left them alone (see "skipped" in the
+                table). If a newer sale is still running on them, revert that one first.
+                "Put them back anyway" sets them to this job's old prices regardless.
+              </Banner>
+            )}
             {fetcher.data && !fetcher.data.ok && (
               <Banner tone="critical">{fetcher.data.error}</Banner>
             )}
@@ -366,8 +414,18 @@ export default function JobDetail() {
               Variants ({job.items.length})
             </Text>
             <DataTable
-              columnContentTypes={["text", "numeric", "numeric", "numeric", "numeric", "text", "text"]}
+              columnContentTypes={[
+                "text",
+                "text",
+                "numeric",
+                "numeric",
+                "numeric",
+                "numeric",
+                "text",
+                "text",
+              ]}
               headings={[
+                "Product",
                 "SKU",
                 "Old price",
                 "New price",
@@ -377,6 +435,7 @@ export default function JobDetail() {
                 "Status",
               ]}
               rows={job.items.map((item) => [
+                item.productTitle ?? "—",
                 item.sku ?? "—",
                 Number(item.oldPrice).toFixed(2),
                 Number(item.newPrice).toFixed(2),
@@ -390,7 +449,9 @@ export default function JobDetail() {
                       )
                       .join("; ")
                   : "—",
-                item.status,
+                item.errorMessage && (item.status === "skipped" || item.status === "error" || item.status === "notApplied")
+                  ? `${item.status}: ${item.errorMessage}`
+                  : item.status,
               ])}
             />
           </BlockStack>
@@ -469,6 +530,7 @@ function describeRule(job: ReturnType<typeof useLoaderData<typeof loader>>["job"
       ? `max ${job.options.maxDiscountPercent}% off`
       : null,
     job.skipExistingCompareAt ? "skipping variants already on sale" : null,
+    job.saleTag ? `tagging products "${job.saleTag}"` : null,
   ].filter(Boolean);
   return extras.length ? `${rule} (${extras.join(", ")})` : rule;
 }

@@ -26,6 +26,7 @@ export default function App() {
         </Link>
         <Link to="/app/jobs/new">New price change</Link>
         <Link to="/app/csv">CSV upload</Link>
+        <Link to="/app/history">Price history</Link>
       </NavMenu>
       <Outlet />
     </AppProvider>

@@ -25,6 +25,13 @@ api_version = "2024-10"
   topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
 
+  # Handled by: /app/routes/webhooks.products.tsx
+  # Lets jobs set to "apply to products that match later" pick up new or
+  # newly tagged products within seconds (needs `npm run deploy` to register).
+  [[webhooks.subscriptions]]
+  topics = [ "products/create", "products/update" ]
+  uri = "/webhooks/products"
+
   # Webhooks can have filters
   # Only receive webhooks for product updates with a product price >= 10.00
   # See: https://shopify.dev/docs/apps/build/webhooks/customize/filters

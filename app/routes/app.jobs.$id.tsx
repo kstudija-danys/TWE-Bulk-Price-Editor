@@ -11,19 +11,24 @@ import {
   Banner,
   ProgressBar,
   Checkbox,
+  Button,
+  InlineStack,
 } from "@shopify/polaris";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import {
   applyMissingMarketPricesInBackground,
+  applyToNewProductsInBackground,
   canApplyMissingMarketPrices,
+  canApplyToNewProducts,
+  findNewMatches,
   isJobActiveInThisProcess,
   pricingOptionsOf,
   resumeJobInBackground,
   revertJob,
 } from "../lib/jobs.server";
-import { describeAdvancedFilter } from "../lib/filters";
+import { describeAdvancedFilter, SYNC_INTERVAL_MINUTES } from "../lib/filters";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -63,6 +68,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         job.items.filter((i) => i.status === "applied").length,
       ),
       skipExistingCompareAt: job.skipExistingCompareAt,
+      canApplyToNewProducts: canApplyToNewProducts(job),
+      autoApplyNewProducts: job.autoApplyNewProducts,
+      lastSyncedAt: job.lastSyncedAt?.toISOString() ?? null,
       items: job.items.map((i) => ({
         id: i.id,
         sku: i.sku,
@@ -85,12 +93,23 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   };
 };
 
+type NewMatchRow = {
+  product: string;
+  sku: string | null;
+  oldPrice: number;
+  newPrice: number;
+  newCompareAtPrice: number | null;
+};
+
 type RevertActionResponse = {
   ok: boolean;
-  intent?: "revert" | "resume" | "markets";
+  intent?: "revert" | "resume" | "markets" | "findNew" | "applyNew" | "autoApply";
   result?: { succeeded: string[]; failed: { variantId: string; error: string }[] };
+  newMatches?: { count: number; rows: NewMatchRow[] };
   error?: string;
 };
+
+const NEW_MATCH_ROWS = 50;
 
 export const action = async ({
   request,
@@ -109,6 +128,60 @@ export const action = async ({
     console.log(`[resume] resuming job ${job.id}`);
     resumeJobInBackground(session.shop, job.id);
     return { ok: true, intent: "resume" };
+  }
+
+  const intent = formData.get("intent");
+  if (intent === "findNew" || intent === "applyNew" || intent === "autoApply") {
+    const job = await prisma.priceJob.findFirst({
+      where: { id: params.id, shopName: session.shop },
+    });
+    if (!job) return { ok: false, intent, error: "Job not found." };
+
+    if (intent === "autoApply") {
+      const enabled = formData.get("enabled") === "true";
+      await prisma.priceJob.update({
+        where: { id: job.id },
+        // Clearing lastSyncedAt makes the scheduler check within a minute.
+        data: { autoApplyNewProducts: enabled, ...(enabled ? { lastSyncedAt: null } : {}) },
+      });
+      return { ok: true, intent };
+    }
+
+    if (!canApplyToNewProducts(job) || isJobActiveInThisProcess(job.id)) {
+      return {
+        ok: false,
+        intent,
+        error: "This job can't be applied to new products right now (it must be completed and not reverted).",
+      };
+    }
+
+    if (intent === "findNew") {
+      try {
+        const matches = await findNewMatches(admin, job.id);
+        return {
+          ok: true,
+          intent,
+          newMatches: {
+            count: matches.length,
+            rows: matches.slice(0, NEW_MATCH_ROWS).map((m) => ({
+              product:
+                m.variantTitle && m.variantTitle !== "Default Title"
+                  ? `${m.productTitle} — ${m.variantTitle}`
+                  : m.productTitle ?? "—",
+              sku: m.sku,
+              oldPrice: m.oldPrice,
+              newPrice: m.newPrice,
+              newCompareAtPrice: m.newCompareAtPrice,
+            })),
+          },
+        };
+      } catch (error) {
+        return { ok: false, intent, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+
+    applyToNewProductsInBackground(session.shop, job.id);
+    return { ok: true, intent };
   }
 
   if (formData.get("intent") === "markets") {
@@ -186,10 +259,15 @@ export default function JobDetail() {
 
   useEffect(() => {
     if (fetcher.state !== "idle" || !fetcher.data?.ok) return;
-    if (fetcher.data.intent === "resume" || fetcher.data.intent === "markets") {
+    const { intent } = fetcher.data;
+    if (intent === "findNew") return;
+    if (intent === "applyNew" || intent === "autoApply") {
       shopify.toast.show(
-        fetcher.data.intent === "resume" ? "Resuming job" : "Updating market prices",
+        intent === "applyNew" ? "Applying to new products" : "Auto-apply setting saved",
       );
+      revalidator.revalidate();
+    } else if (intent === "resume" || intent === "markets") {
+      shopify.toast.show(intent === "resume" ? "Resuming job" : "Updating market prices");
       revalidator.revalidate();
     } else {
       shopify.toast.show("Job reverted");
@@ -277,6 +355,10 @@ export default function JobDetail() {
             )}
           </BlockStack>
         </Card>
+
+        {(job.canApplyToNewProducts || job.autoApplyNewProducts) && job.status !== "reverted" && (
+          <NewProductsCard job={job} fetcher={fetcher} busy={isReverting || isActive} />
+        )}
 
         <Card>
           <BlockStack gap="200">
@@ -389,4 +471,88 @@ function describeRule(job: ReturnType<typeof useLoaderData<typeof loader>>["job"
     job.skipExistingCompareAt ? "skipping variants already on sale" : null,
   ].filter(Boolean);
   return extras.length ? `${rule} (${extras.join(", ")})` : rule;
+}
+
+function NewProductsCard({
+  job,
+  fetcher,
+  busy,
+}: {
+  job: ReturnType<typeof useLoaderData<typeof loader>>["job"];
+  fetcher: ReturnType<typeof useFetcher<typeof action>>;
+  busy: boolean;
+}) {
+  const data = fetcher.data;
+  const found = data?.intent === "findNew" && data.ok ? data.newMatches : undefined;
+  const submitting = fetcher.state !== "idle" ? fetcher.formData?.get("intent") : null;
+
+  return (
+    <Card>
+      <BlockStack gap="300">
+        <Text as="h2" variant="headingMd">
+          New products
+        </Text>
+        <Text as="p" tone="subdued">
+          Products added or tagged after this change ran don't have it yet. Find the ones
+          that match this job's filter now and give them the same change. They become part
+          of this job, so Revert and auto-revert undo them too.
+        </Text>
+        <Checkbox
+          label={`Apply to new matching products automatically (checked every ${SYNC_INTERVAL_MINUTES} minutes)`}
+          checked={job.autoApplyNewProducts}
+          disabled={submitting === "autoApply"}
+          onChange={(enabled) =>
+            fetcher.submit({ intent: "autoApply", enabled: String(enabled) }, { method: "POST" })
+          }
+        />
+        {job.lastSyncedAt && (
+          <Text as="p" variant="bodySm" tone="subdued">
+            Last checked {new Date(job.lastSyncedAt).toLocaleString()}
+          </Text>
+        )}
+        <InlineStack gap="300">
+          <Button
+            onClick={() => fetcher.submit({ intent: "findNew" }, { method: "POST" })}
+            loading={submitting === "findNew"}
+            disabled={busy || !job.canApplyToNewProducts}
+          >
+            Find new products
+          </Button>
+          {found && found.count > 0 && (
+            <Button
+              variant="primary"
+              onClick={() => fetcher.submit({ intent: "applyNew" }, { method: "POST" })}
+              loading={submitting === "applyNew"}
+              disabled={busy}
+            >
+              {`Apply to ${found.count} variant${found.count === 1 ? "" : "s"}`}
+            </Button>
+          )}
+        </InlineStack>
+        {found && found.count === 0 && (
+          <Text as="p">No new products match — everything matching already has this change.</Text>
+        )}
+        {found && found.count > 0 && (
+          <BlockStack gap="100">
+            <DataTable
+              columnContentTypes={["text", "text", "numeric", "numeric", "numeric"]}
+              headings={["Product", "SKU", "Current price", "New price", "New compare-at"]}
+              rows={found.rows.map((r) => [
+                r.product,
+                r.sku ?? "—",
+                r.oldPrice.toFixed(2),
+                r.newPrice.toFixed(2),
+                r.newCompareAtPrice?.toFixed(2) ?? "—",
+              ])}
+            />
+            {found.count > found.rows.length && (
+              <Text as="span" tone="subdued">
+                Showing first {found.rows.length} of {found.count}.
+              </Text>
+            )}
+          </BlockStack>
+        )}
+      </BlockStack>
+    </Card>
+  );
 }

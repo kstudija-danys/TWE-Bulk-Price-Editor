@@ -94,6 +94,11 @@ model PriceJob {
   minPrice              Decimal?       @db.Decimal(12, 4)
   /// Never lower a price by more than this percent.
   maxDiscountPercent    Decimal?       @db.Decimal(6, 2)
+  /// Keep applying this job's rule to products that start matching its
+  /// filter later (e.g. products uploaded after a sale started).
+  autoApplyNewProducts  Boolean        @default(false)
+  /// When the job last checked for newly matching products.
+  lastSyncedAt          DateTime?
   /// Set once the job's market fixed prices (e.g. UK GBP) have been read and recorded.
   /// False on jobs that ran before market prices were supported.
   marketPricesRecorded  Boolean        @default(false)

@@ -3,6 +3,9 @@
 // Shopify search can't do reliably (exclusions, price range, SKU/title text,
 // stock), which run on the variants the query returned.
 
+/** How often jobs set to "also apply to products that match later" check for new products. */
+export const SYNC_INTERVAL_MINUTES = 15;
+
 export type ProductStatus = "ACTIVE" | "DRAFT" | "ARCHIVED";
 export type StockFilter = "any" | "inStock" | "outOfStock";
 
@@ -31,6 +34,11 @@ export type AdvancedFilter = FilterCriteria & {
   /** Case-insensitive "contains" on the product title. */
   titleContains: string;
   stock: StockFilter;
+  /**
+   * Filters saved before per-field matching existed: their "AND" required
+   * every single value (e.g. both tags), so re-running them keeps that.
+   */
+  legacyAllValues?: boolean;
 };
 
 /** The subset of a resolved variant that filtering looks at. */
@@ -69,6 +77,7 @@ export function parseAdvancedFilter(filterValue: string): AdvancedFilter {
     skuContains: raw.skuContains ?? "",
     titleContains: raw.titleContains ?? "",
     stock: raw.stock ?? "any",
+    legacyAllValues: raw.statuses === undefined && raw.combinator === "AND",
   };
 }
 
@@ -97,8 +106,9 @@ export function buildProductSearchQuery(filter: AdvancedFilter): string {
     filter.collectionIds.map((c) => `collection_id:${numericId(c)}`),
   ];
 
-  const include =
-    filter.combinator === "AND"
+  const include = filter.legacyAllValues
+    ? fields.flat().join(" AND ")
+    : filter.combinator === "AND"
       ? fields
           .map(anyOf)
           .filter((g): g is string => g !== null)

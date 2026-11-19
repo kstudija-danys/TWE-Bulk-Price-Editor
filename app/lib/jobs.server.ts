@@ -25,6 +25,7 @@ import {
   applyVariantFilters,
   buildProductSearchQuery,
   parseAdvancedFilter,
+  SYNC_INTERVAL_MINUTES,
 } from "./filters";
 import type { JobFilterType } from "@prisma/client";
 
@@ -232,6 +233,7 @@ export async function createJob(params: {
   revertAt: Date | null;
   skipExistingCompareAt: boolean;
   options?: PricingOptions;
+  autoApplyNewProducts?: boolean;
   items: JobItemPreview[];
 }) {
   const {
@@ -264,6 +266,7 @@ export async function createJob(params: {
       rounding: options.rounding === "none" ? null : options.rounding,
       minPrice: options.minPrice,
       maxDiscountPercent: options.maxDiscountPercent,
+      autoApplyNewProducts: params.autoApplyNewProducts ?? false,
       status: runAt && runAt.getTime() > Date.now() ? "scheduled" : "draft",
       items: {
         create: items.map((item) => ({
@@ -363,6 +366,19 @@ type JobItemRow = Awaited<ReturnType<typeof prisma.priceJobItem.findMany>>[numbe
 async function ensureMarketRows(admin: AdminGraphqlClient, jobId: string, items: JobItemRow[]) {
   const job = await prisma.priceJob.findUniqueOrThrow({ where: { id: jobId } });
   if (job.marketPricesRecorded) return;
+  await recordMarketRows(admin, job, items);
+}
+
+/**
+ * Reads the given items' current market fixed prices and records them with
+ * their new values, then marks the job's market prices as recorded.
+ */
+async function recordMarketRows(
+  admin: AdminGraphqlClient,
+  job: Awaited<ReturnType<typeof prisma.priceJob.findUniqueOrThrow>>,
+  items: JobItemRow[],
+) {
+  const jobId = job.id;
 
   const rule: PriceRule = {
     mode: job.mode,
@@ -759,4 +775,159 @@ export async function revertJob(admin: AdminGraphqlClient, jobId: string) {
   ]);
 
   return { succeeded, failed };
+}
+
+// ---------------------------------------------------------------------------
+// Applying a finished job to products that match its filter later
+//
+// e.g. a Black Friday job ran on everything tagged "black-month", then more
+// products got that tag: these find those products and give them the same
+// change, as part of the same job (so Revert and auto-revert cover them too).
+// ---------------------------------------------------------------------------
+
+
+type SyncableJob = {
+  status: string;
+  filterType: JobFilterType;
+  revertAt: Date | null;
+};
+
+/** Whether a job can be applied to newly matching products. */
+export function canApplyToNewProducts(job: SyncableJob): boolean {
+  return (
+    job.status === "completed" &&
+    job.filterType !== "manual" &&
+    job.filterType !== "csv" &&
+    (job.revertAt === null || job.revertAt.getTime() > Date.now())
+  );
+}
+
+/**
+ * The variants that match a completed job's filter now but aren't part of
+ * the job yet, with the job's rule applied. Skips variants in a job that is
+ * running right now, and (if the job does) variants already on sale.
+ */
+export async function findNewMatches(
+  admin: AdminGraphqlClient,
+  jobId: string,
+): Promise<JobItemPreview[]> {
+  const job = await prisma.priceJob.findUniqueOrThrow({ where: { id: jobId } });
+  if (!canApplyToNewProducts(job) || !job.filterValue) return [];
+
+  const [matches, existing, busy] = await Promise.all([
+    resolveJobVariants(admin, job.filterType, job.filterValue),
+    prisma.priceJobItem.findMany({ where: { jobId }, select: { variantId: true } }),
+    prisma.priceJobItem.findMany({
+      where: { job: { status: "running", id: { not: jobId }, shopName: job.shopName } },
+      select: { variantId: true },
+    }),
+  ]);
+  const skip = new Set([...existing, ...busy].map((i) => i.variantId));
+  const variants = matches.filter(
+    (v) =>
+      !skip.has(v.variantId) &&
+      !(job.skipExistingCompareAt && v.compareAtPrice !== null && Number(v.compareAtPrice) > 0),
+  );
+
+  return buildPreview({
+    mode: job.mode,
+    targetField: job.targetField,
+    value: job.value !== null ? Number(job.value) : 0,
+    options: pricingOptionsOf(job),
+    variants,
+  });
+}
+
+/**
+ * Adds the newly matching variants to a completed job and applies the job's
+ * change to them (and their market fixed prices). Returns how many were added.
+ */
+export async function applyToNewProducts(admin: AdminGraphqlClient, jobId: string) {
+  if (activeJobIds.has(jobId)) return { succeeded: [], failed: [] };
+  activeJobIds.add(jobId);
+  try {
+    const newItems = await findNewMatches(admin, jobId);
+    await prisma.priceJob.update({ where: { id: jobId }, data: { lastSyncedAt: new Date() } });
+    if (newItems.length === 0) return { succeeded: [], failed: [] };
+
+    const job = await prisma.priceJob.findUniqueOrThrow({ where: { id: jobId } });
+    // Re-check: the job may have been reverted while we were looking.
+    if (job.status !== "completed") return { succeeded: [], failed: [] };
+
+    await prisma.$transaction([
+      prisma.priceJobItem.createMany({
+        data: newItems.map((item) => ({
+          jobId,
+          variantId: item.variantId,
+          productId: item.productId,
+          sku: item.sku,
+          oldPrice: item.oldPrice,
+          newPrice: item.newPrice,
+          oldCompareAtPrice: item.oldCompareAtPrice,
+          newCompareAtPrice: item.newCompareAtPrice,
+        })),
+      }),
+      prisma.priceJob.update({ where: { id: jobId }, data: { status: "running" } }),
+    ]);
+    const rows = await prisma.priceJobItem.findMany({
+      where: { jobId, status: "pending", variantId: { in: newItems.map((i) => i.variantId) } },
+    });
+    console.log(`[jobs] job ${jobId}: applying to ${rows.length} newly matching variants`);
+
+    // Jobs that never recorded market prices get them later via the
+    // "Update market prices" banner, which covers these items too.
+    if (job.marketPricesRecorded) await recordMarketRows(admin, job, rows);
+    return await applyItemsAndFinish(admin, jobId, rows);
+  } finally {
+    activeJobIds.delete(jobId);
+  }
+}
+
+/**
+ * Runs applyToNewProducts without waiting. Unlike other background runs, a
+ * crash here must not mark the job failed: its original prices are applied
+ * and must stay revertable. The job's status is recomputed from its items.
+ */
+export function applyToNewProductsInBackground(shopName: string, jobId: string) {
+  void (async () => {
+    try {
+      const { admin } = await unauthenticated.admin(shopName);
+      const result = await applyToNewProducts(admin, jobId);
+      if (result.succeeded.length || result.failed.length) {
+        console.log(
+          `[jobs] job ${jobId} new products: ${result.succeeded.length} applied, ${result.failed.length} failed`,
+        );
+      }
+    } catch (error) {
+      console.error(`[jobs] applying job ${jobId} to new products failed`, error);
+      try {
+        const job = await prisma.priceJob.findUnique({ where: { id: jobId } });
+        if (job?.status === "running") await finishJob(jobId);
+        await prisma.priceJob.update({
+          where: { id: jobId },
+          data: {
+            errorMessage: `Couldn't apply to new products: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          },
+        });
+      } catch (e) {
+        console.error(`[jobs] could not record sync failure for job ${jobId}`, e);
+      }
+    }
+  })();
+}
+
+/** Every auto-apply job due for a check for new products, across all shops. */
+export async function dueAutoApplyJobs() {
+  const cutoff = new Date(Date.now() - SYNC_INTERVAL_MINUTES * 60_000);
+  const jobs = await prisma.priceJob.findMany({
+    where: {
+      autoApplyNewProducts: true,
+      status: "completed",
+      OR: [{ lastSyncedAt: null }, { lastSyncedAt: { lte: cutoff } }],
+    },
+    select: { id: true, shopName: true, status: true, filterType: true, revertAt: true },
+  });
+  return jobs.filter(canApplyToNewProducts);
 }

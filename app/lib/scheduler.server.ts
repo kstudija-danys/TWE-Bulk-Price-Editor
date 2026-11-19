@@ -4,7 +4,12 @@
 import cron from "node-cron";
 import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
-import { executeJob, revertJob } from "./jobs.server";
+import {
+  applyToNewProductsInBackground,
+  dueAutoApplyJobs,
+  executeJob,
+  revertJob,
+} from "./jobs.server";
 
 declare global {
   var schedulerStarted: boolean | undefined;
@@ -49,9 +54,17 @@ async function runDueAutoReverts() {
   }
 }
 
+/** Applies auto-apply jobs to products that started matching their filter. */
+async function runDueAutoApplies() {
+  for (const job of await dueAutoApplyJobs()) {
+    applyToNewProductsInBackground(job.shopName, job.id);
+  }
+}
+
 async function tick() {
   await runDueScheduledJobs();
   await runDueAutoReverts();
+  await runDueAutoApplies();
 }
 
 /** Starts the cron poll loop once per process (safe to call on every module load, e.g. across Vite HMR in dev). */

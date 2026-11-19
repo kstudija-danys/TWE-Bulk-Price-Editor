@@ -37,7 +37,12 @@ import {
   type PricingOptions,
   type Rounding,
 } from "../lib/pricing";
-import type { AdvancedFilter, ProductStatus, StockFilter } from "../lib/filters";
+import {
+  SYNC_INTERVAL_MINUTES,
+  type AdvancedFilter,
+  type ProductStatus,
+  type StockFilter,
+} from "../lib/filters";
 import { MultiValuePicker } from "../components/MultiValuePicker";
 import type { JobFilterType } from "@prisma/client";
 
@@ -87,6 +92,8 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
   const runAtRaw = formData.get("runAt") as string;
   const revertAtRaw = formData.get("revertAt") as string;
   const skipExistingCompareAt = formData.get("skipExistingCompareAt") === "true";
+  const autoApplyNewProducts =
+    filterType === "advanced" && formData.get("autoApplyNewProducts") === "true";
   const rounding = formData.get("rounding") as Rounding;
   const options: PricingOptions = {
     rounding: ROUNDINGS.includes(rounding) ? rounding : "none",
@@ -157,6 +164,7 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
       revertAt,
       skipExistingCompareAt,
       options,
+      autoApplyNewProducts,
       items,
     });
 
@@ -285,6 +293,7 @@ export default function NewJob() {
   const [runAt, setRunAt] = useState("");
   const [revertAt, setRevertAt] = useState("");
   const [skipExistingCompareAt, setSkipExistingCompareAt] = useState(false);
+  const [autoApplyNewProducts, setAutoApplyNewProducts] = useState(false);
 
   const isLoading = fetcher.state !== "idle";
   const isPreview = fetcher.data?.intent === "preview";
@@ -402,6 +411,7 @@ export default function NewJob() {
         runAt: localToIso(runAt),
         revertAt: localToIso(revertAt),
         skipExistingCompareAt: String(skipExistingCompareAt),
+        autoApplyNewProducts: String(autoApplyNewProducts),
         rounding,
         minPrice,
         maxDiscountPercent,
@@ -706,6 +716,14 @@ export default function NewJob() {
               checked={skipExistingCompareAt}
               onChange={setSkipExistingCompareAt}
             />
+            {filterType === "advanced" && (
+              <Checkbox
+                label="Also apply to products that match later"
+                helpText={`Products added or tagged after the change runs get the same change automatically (checked every ${SYNC_INTERVAL_MINUTES} minutes) until the job is reverted. Revert undoes them too.`}
+                checked={autoApplyNewProducts}
+                onChange={setAutoApplyNewProducts}
+              />
+            )}
 
             <InlineGrid columns={{ xs: 1, md: 2 }} gap="300">
               <TextField

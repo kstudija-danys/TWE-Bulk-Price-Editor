@@ -252,3 +252,64 @@ export function computeMarketPrices(params: {
 
   return { newFixedPrice, newFixedCompareAtPrice };
 }
+
+/** Two money amounts are equal to the penny (null only equals null). */
+export function sameMoney(a: number | null, b: number | null): boolean {
+  if (a === null || b === null) return a === b;
+  return Math.abs(a - b) < 0.005;
+}
+
+export type RevertDecision = "revert" | "alreadyOld" | "skip";
+
+/** A compare-at amount, with "none" written as null (Shopify may report 0). */
+export function normCompareAt(amount: number | null): number | null {
+  return amount !== null && amount > 0 ? amount : null;
+}
+
+/**
+ * Whether a job changed the compare-at price. A null new compare-at means the
+ * job left it alone (that's how apply treats it, e.g. a CSV row without one);
+ * a stored 0 means it was cleared.
+ */
+export function jobChangedCompareAt(
+  oldCompareAt: number | null,
+  newCompareAt: number | null,
+): boolean {
+  return newCompareAt !== null && !sameMoney(normCompareAt(oldCompareAt), normCompareAt(newCompareAt));
+}
+
+export function jobChangedPrice(oldPrice: number, newPrice: number): boolean {
+  return !sameMoney(oldPrice, newPrice);
+}
+
+/**
+ * Whether a price this job set can be safely put back: only if what the job
+ * changed is still what it set. If it's already back at the old value there's
+ * nothing to do; anything else was changed after the job (by another job or
+ * by hand). Price and compare-at only count when the job changed them.
+ */
+export function revertDecision(params: {
+  currentPrice: number;
+  currentCompareAt: number | null;
+  oldPrice: number;
+  newPrice: number;
+  oldCompareAt: number | null;
+  newCompareAt: number | null;
+}): RevertDecision {
+  const { currentPrice, oldPrice, newPrice, oldCompareAt, newCompareAt } = params;
+  const current = normCompareAt(params.currentCompareAt);
+  const priceChanged = jobChangedPrice(oldPrice, newPrice);
+  const compareAtChanged = jobChangedCompareAt(oldCompareAt, newCompareAt);
+
+  const isNew =
+    (!priceChanged || sameMoney(currentPrice, newPrice)) &&
+    (!compareAtChanged || sameMoney(current, normCompareAt(newCompareAt)));
+  // Nothing changed at all (e.g. a 0% rule): nothing to put back.
+  if (!priceChanged && !compareAtChanged) return "alreadyOld";
+  if (isNew) return "revert";
+
+  const isOld =
+    (!priceChanged || sameMoney(currentPrice, oldPrice)) &&
+    (!compareAtChanged || sameMoney(current, normCompareAt(oldCompareAt)));
+  return isOld ? "alreadyOld" : "skip";
+}

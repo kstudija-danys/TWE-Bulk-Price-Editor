@@ -55,6 +55,8 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<CsvAction
       variantId: resolved.variantId,
       productId: resolved.productId,
       sku: resolved.sku,
+      productTitle: resolved.productTitle,
+      variantTitle: resolved.variantTitle,
       oldPrice: Number(resolved.price),
       newPrice: Number(row.price),
       oldCompareAtPrice: resolved.compareAtPrice !== null ? Number(resolved.compareAtPrice) : null,

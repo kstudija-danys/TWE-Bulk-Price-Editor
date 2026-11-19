@@ -72,6 +72,12 @@ enum JobItemStatus {
   applied
   reverted
   error
+  /// Left alone on revert because its price was changed after this job set
+  /// it (by another job or by hand), or the variant no longer exists.
+  skipped
+  /// Never changed: skipped when the job ran (deleted, or already on sale
+  /// with "skip variants already on sale"). Revert never touches these.
+  notApplied
 }
 
 model PriceJob {
@@ -99,6 +105,12 @@ model PriceJob {
   autoApplyNewProducts  Boolean        @default(false)
   /// When the job last checked for newly matching products.
   lastSyncedAt          DateTime?
+  /// Product tag added while the job's change is live, removed on revert
+  /// (e.g. "black-month-sale", for an automated Sale collection).
+  saleTag               String?        @db.VarChar(255)
+  /// Set once a scheduled job's prices were recomputed from live prices at
+  /// run time, so a resume after a cut-off knows whether to do it.
+  pricesRefreshedAt     DateTime?
   /// Set once the job's market fixed prices (e.g. UK GBP) have been read and recorded.
   /// False on jobs that ran before market prices were supported.
   marketPricesRecorded  Boolean        @default(false)
@@ -119,16 +131,22 @@ model PriceJobItem {
   variantId         String
   productId         String
   sku               String?
+  /// Product (and variant) title when the job was created, for price history.
+  productTitle      String?               @db.VarChar(512)
   oldPrice          Decimal               @db.Decimal(12, 4)
   newPrice          Decimal               @db.Decimal(12, 4)
   oldCompareAtPrice Decimal?              @db.Decimal(12, 4)
   newCompareAtPrice Decimal?              @db.Decimal(12, 4)
   status            JobItemStatus         @default(pending)
   errorMessage      String?               @db.Text
+  /// This job added its sale tag to the product (it didn't have it before),
+  /// so revert may remove it again.
+  taggedByJob       Boolean               @default(false)
   marketPrices      PriceJobMarketPrice[]
 
   @@index([jobId])
   @@index([variantId])
+  @@index([sku])
 }
 
 /// A variant's fixed price in a market price list (e.g. the UK market's GBP

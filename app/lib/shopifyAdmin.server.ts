@@ -45,6 +45,7 @@ export type VariantPriceUpdate = {
   variantId: string;
   productId: string;
   price?: string;
+  /** A value sets it, null clears it, undefined leaves it as it is. */
   compareAtPrice?: string | null;
 };
 
@@ -106,7 +107,9 @@ export async function applyVariantPriceUpdates(
             variants: batch.map((u) => ({
               id: u.variantId,
               price: u.price,
-              compareAtPrice: u.compareAtPrice ?? undefined,
+              // Kept as-is: null must reach Shopify to clear a compare-at
+              // price; undefined is dropped from the JSON and changes nothing.
+              compareAtPrice: u.compareAtPrice,
             })),
           },
         );
@@ -657,4 +660,117 @@ export async function applyFixedPriceUpdates(
   }
 
   return { succeeded, failed };
+}
+
+// ---------------------------------------------------------------------------
+// Product tags (sale tag added while a job's change is live)
+// ---------------------------------------------------------------------------
+
+/**
+ * Adds or removes one tag on each of the given products. Returns the products
+ * that failed, with the reason.
+ */
+export async function setProductTag(
+  admin: AdminGraphqlClient,
+  productIds: string[],
+  tag: string,
+  action: "add" | "remove",
+): Promise<{ productId: string; error: string; definite: boolean }[]> {
+  // definite: Shopify answered and refused. Otherwise (network error, timeout)
+  // the change may or may not have gone through.
+  const failed: { productId: string; error: string; definite: boolean }[] = [];
+  const mutation =
+    action === "add"
+      ? `#graphql
+        mutation bulkPriceEditorTagsAdd($id: ID!, $tags: [String!]!) {
+          tagsAdd(id: $id, tags: $tags) {
+            userErrors {
+              message
+            }
+          }
+        }`
+      : `#graphql
+        mutation bulkPriceEditorTagsRemove($id: ID!, $tags: [String!]!) {
+          tagsRemove(id: $id, tags: $tags) {
+            userErrors {
+              message
+            }
+          }
+        }`;
+  const field = action === "add" ? "tagsAdd" : "tagsRemove";
+
+  for (const productId of productIds) {
+    try {
+      const json = await graphqlWithRetry(admin, mutation, { id: productId, tags: [tag] });
+      const errors = json.data?.[field]?.userErrors ?? [];
+      if (errors.length) {
+        failed.push({
+          productId,
+          error: errors.map((e: { message: string }) => e.message).join("; "),
+          definite: true,
+        });
+      }
+    } catch (error) {
+      failed.push({
+        productId,
+        error: error instanceof Error ? error.message : String(error),
+        definite: false,
+      });
+    }
+  }
+  return failed;
+}
+
+/** Titles of the given nodes (e.g. collections), keyed by id. Missing nodes are left out. */
+export async function fetchNodeTitles(
+  admin: AdminGraphqlClient,
+  ids: string[],
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  for (const batch of chunk(ids, 100)) {
+    const json = await graphqlWithRetry(
+      admin,
+      `#graphql
+      query bulkPriceEditorNodeTitles($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          id
+          ... on Collection {
+            title
+          }
+        }
+      }`,
+      { ids: batch },
+    );
+    for (const node of json.data?.nodes ?? []) {
+      if (node?.id && node.title) out.set(node.id, node.title);
+    }
+  }
+  return out;
+}
+
+/** Each product's current tags, keyed by product id. Missing products are left out. */
+export async function fetchProductTags(
+  admin: AdminGraphqlClient,
+  productIds: string[],
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  for (const batch of chunk(productIds, 100)) {
+    const json = await graphqlWithRetry(
+      admin,
+      `#graphql
+      query bulkPriceEditorProductTags($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on Product {
+            id
+            tags
+          }
+        }
+      }`,
+      { ids: batch },
+    );
+    for (const node of json.data?.nodes ?? []) {
+      if (node?.id) out.set(node.id, node.tags ?? []);
+    }
+  }
+  return out;
 }

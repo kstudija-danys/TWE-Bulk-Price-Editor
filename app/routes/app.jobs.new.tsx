@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useFetcher, useLoaderData, useNavigate } from "@remix-run/react";
+import { useFetcher, useLoaderData, useLocation, useNavigate } from "@remix-run/react";
 import {
   Page,
   Card,
@@ -18,6 +18,7 @@ import {
   ChoiceList,
   Collapsible,
   Divider,
+  Link,
 } from "@shopify/polaris";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -25,11 +26,19 @@ import {
   buildPreview,
   createJob,
   executeJobInBackground,
+  findOverlappingJobs,
+  pricingOptionsOf,
   previewMarketChanges,
   resolveJobVariants,
   type MarketPriceChange,
+  type OverlappingJob,
 } from "../lib/jobs.server";
-import { fetchProductFacets, type ProductFacets } from "../lib/shopifyAdmin.server";
+import {
+  fetchNodeTitles,
+  fetchProductFacets,
+  type ProductFacets,
+} from "../lib/shopifyAdmin.server";
+import prisma from "../db.server";
 import {
   ROUNDINGS,
   type JobMode,
@@ -38,6 +47,7 @@ import {
   type Rounding,
 } from "../lib/pricing";
 import {
+  parseAdvancedFilter,
   SYNC_INTERVAL_MINUTES,
   type AdvancedFilter,
   type ProductStatus,
@@ -46,16 +56,85 @@ import {
 import { MultiValuePicker } from "../components/MultiValuePicker";
 import type { JobFilterType } from "@prisma/client";
 
+/** A previous job's settings, to start a new job from ("Duplicate"). */
+type JobTemplate = {
+  sourceName: string;
+  /** The source used old "match ALL" (every value) matching, which copies can't express. */
+  legacyAllValues: boolean;
+  name: string;
+  filterType: "advanced" | "manual";
+  filter: AdvancedFilter | null;
+  manualVariantIds: string[];
+  collectionTitles: Record<string, string>;
+  mode: string;
+  targetField: string;
+  value: string;
+  rounding: Rounding;
+  minPrice: string;
+  maxDiscountPercent: string;
+  skipExistingCompareAt: boolean;
+  autoApplyNewProducts: boolean;
+  saleTag: string;
+};
+
+async function loadTemplate(
+  admin: Parameters<typeof fetchNodeTitles>[0],
+  shop: string,
+  jobId: string,
+): Promise<JobTemplate | null> {
+  const job = await prisma.priceJob.findFirst({ where: { id: jobId, shopName: shop } });
+  if (!job || job.mode === "csv" || !job.filterValue) return null;
+  if (job.filterType !== "advanced" && job.filterType !== "manual") return null;
+
+  const filter = job.filterType === "advanced" ? parseAdvancedFilter(job.filterValue) : null;
+  const collectionIds = filter ? [...filter.collectionIds, ...filter.exclude.collectionIds] : [];
+  let collectionTitles: Record<string, string> = {};
+  if (collectionIds.length) {
+    try {
+      collectionTitles = Object.fromEntries(await fetchNodeTitles(admin, collectionIds));
+    } catch (error) {
+      console.error("[jobs.new] couldn't load collection titles", error);
+    }
+  }
+  const options = pricingOptionsOf(job);
+  const sourceName = job.name || "price change";
+  return {
+    sourceName,
+    legacyAllValues: Boolean(filter?.legacyAllValues),
+    name: job.name ? `Copy of ${job.name}` : "",
+    filterType: job.filterType,
+    // Old "match ALL" filters needed every value; the copy uses today's
+    // per-field matching, and the form warns about it (legacyAllValues).
+    filter: filter ? { ...filter, legacyAllValues: undefined } : null,
+    manualVariantIds: job.filterType === "manual" ? JSON.parse(job.filterValue) : [],
+    collectionTitles,
+    mode: job.mode,
+    targetField: job.targetField,
+    value: job.value?.toString() ?? "",
+    rounding: options.rounding,
+    minPrice: options.minPrice?.toString() ?? "",
+    maxDiscountPercent: options.maxDiscountPercent?.toString() ?? "",
+    skipExistingCompareAt: job.skipExistingCompareAt,
+    autoApplyNewProducts: job.autoApplyNewProducts,
+    saleTag: job.saleTag ?? "",
+  };
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+  const fromJobId = new URL(request.url).searchParams.get("from");
+
   // The pickers still work (free text) if this fails, so don't block the page.
   let facets: ProductFacets = { tags: [], vendors: [], productTypes: [] };
-  try {
-    facets = await fetchProductFacets(admin);
-  } catch (error) {
-    console.error("[jobs.new] couldn't load tags/vendors/product types", error);
-  }
-  return { facets };
+  const [facetsResult, template] = await Promise.all([
+    fetchProductFacets(admin).catch((error) => {
+      console.error("[jobs.new] couldn't load tags/vendors/product types", error);
+      return null;
+    }),
+    fromJobId ? loadTemplate(admin, session.shop, fromJobId) : Promise.resolve(null),
+  ]);
+  if (facetsResult) facets = facetsResult;
+  return { facets, template };
 };
 
 type ActionResponse = {
@@ -65,6 +144,8 @@ type ActionResponse = {
   /** Market fixed-price changes for the variants shown in the preview, keyed by variant id. */
   marketChanges?: Record<string, MarketPriceChange[]>;
   marketChangeCount?: number;
+  /** Other live or upcoming jobs on the same variants. */
+  overlaps?: OverlappingJob[];
   jobId?: string;
   error?: string;
 };
@@ -94,6 +175,7 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
   const skipExistingCompareAt = formData.get("skipExistingCompareAt") === "true";
   const autoApplyNewProducts =
     filterType === "advanced" && formData.get("autoApplyNewProducts") === "true";
+  const saleTag = String(formData.get("saleTag") ?? "").trim().slice(0, 255);
   const rounding = formData.get("rounding") as Rounding;
   const options: PricingOptions = {
     rounding: ROUNDINGS.includes(rounding) ? rounding : "none",
@@ -103,6 +185,12 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
 
   if (!Number.isFinite(value)) {
     return { intent, error: "Enter a valid number for the change." };
+  }
+  if (saleTag.includes(",")) {
+    return {
+      intent,
+      error: "The sale tag can't contain a comma (Shopify would split it into separate tags).",
+    };
   }
 
   try {
@@ -143,7 +231,11 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
         (n, list) => n + list.length,
         0,
       );
-      return { intent, items, skippedCount, marketChanges, marketChangeCount };
+      const overlaps = await findOverlappingJobs(
+        session.shop,
+        items.map((i) => i.variantId),
+      );
+      return { intent, items, skippedCount, marketChanges, marketChangeCount, overlaps };
     }
 
     const runAt = runAtRaw ? new Date(runAtRaw) : null;
@@ -165,6 +257,7 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionRes
       skipExistingCompareAt,
       options,
       autoApplyNewProducts,
+      saleTag,
       items,
     });
 
@@ -258,42 +351,76 @@ const STOCK_OPTIONS: { label: string; value: StockFilter }[] = [
 
 type Collection = { id: string; title: string };
 
+// Keyed on the URL query: going from "Duplicate" (?from=…) to a blank "New
+// price change" remounts the form, so no copied values linger.
 export default function NewJob() {
-  const { facets } = useLoaderData<typeof loader>();
+  const { search } = useLocation();
+  return <NewJobForm key={search} />;
+}
+
+function NewJobForm() {
+  const { facets, template } = useLoaderData<typeof loader>();
+  const t = template;
+  const f = t?.filter;
+  const titled = (ids: string[] | undefined) =>
+    (ids ?? []).map((id) => ({ id, title: t?.collectionTitles[id] ?? "(collection)" }));
   const fetcher = useFetcher<ActionResponse>();
   const navigate = useNavigate();
   const shopify = useAppBridge();
 
-  const [name, setName] = useState("");
-  const [filterType, setFilterType] = useState("advanced");
-  const [combinator, setCombinator] = useState<"AND" | "OR">("OR");
-  const [tags, setTags] = useState<string[]>([]);
-  const [vendors, setVendors] = useState<string[]>([]);
-  const [productTypes, setProductTypes] = useState<string[]>([]);
-  const [collections, setCollections] = useState<Collection[]>([]);
-  const [excludeTags, setExcludeTags] = useState<string[]>([]);
-  const [excludeVendors, setExcludeVendors] = useState<string[]>([]);
-  const [excludeProductTypes, setExcludeProductTypes] = useState<string[]>([]);
-  const [excludeCollections, setExcludeCollections] = useState<Collection[]>([]);
-  const [statuses, setStatuses] = useState<ProductStatus[]>(["ACTIVE"]);
-  const [minPriceFilter, setMinPriceFilter] = useState("");
-  const [maxPriceFilter, setMaxPriceFilter] = useState("");
-  const [skuContains, setSkuContains] = useState("");
-  const [titleContains, setTitleContains] = useState("");
-  const [stock, setStock] = useState<StockFilter>("any");
-  const [showExclude, setShowExclude] = useState(false);
-  const [showRefine, setShowRefine] = useState(false);
-  const [manualFilterValue, setManualFilterValue] = useState("");
-  const [mode, setMode] = useState("percent");
-  const [targetField, setTargetField] = useState("price");
-  const [value, setValue] = useState("");
-  const [rounding, setRounding] = useState<Rounding>("none");
-  const [minPrice, setMinPrice] = useState("");
-  const [maxDiscountPercent, setMaxDiscountPercent] = useState("");
+  const [name, setName] = useState(t?.name ?? "");
+  const [filterType, setFilterType] = useState<string>(t?.filterType ?? "advanced");
+  const [combinator, setCombinator] = useState<"AND" | "OR">(f?.combinator ?? "OR");
+  const [tags, setTags] = useState<string[]>(f?.tags ?? []);
+  const [vendors, setVendors] = useState<string[]>(f?.vendors ?? []);
+  const [productTypes, setProductTypes] = useState<string[]>(f?.productTypes ?? []);
+  const [collections, setCollections] = useState<Collection[]>(titled(f?.collectionIds));
+  const [excludeTags, setExcludeTags] = useState<string[]>(f?.exclude.tags ?? []);
+  const [excludeVendors, setExcludeVendors] = useState<string[]>(f?.exclude.vendors ?? []);
+  const [excludeProductTypes, setExcludeProductTypes] = useState<string[]>(
+    f?.exclude.productTypes ?? [],
+  );
+  const [excludeCollections, setExcludeCollections] = useState<Collection[]>(
+    titled(f?.exclude.collectionIds),
+  );
+  const [statuses, setStatuses] = useState<ProductStatus[]>(f ? f.statuses : ["ACTIVE"]);
+  const [minPriceFilter, setMinPriceFilter] = useState(f?.minPrice?.toString() ?? "");
+  const [maxPriceFilter, setMaxPriceFilter] = useState(f?.maxPrice?.toString() ?? "");
+  const [skuContains, setSkuContains] = useState(f?.skuContains ?? "");
+  const [titleContains, setTitleContains] = useState(f?.titleContains ?? "");
+  const [stock, setStock] = useState<StockFilter>(f?.stock ?? "any");
+  const [showExclude, setShowExclude] = useState(
+    Boolean(f && Object.values(f.exclude).some((list) => list.length)),
+  );
+  const [showRefine, setShowRefine] = useState(
+    Boolean(
+      f &&
+        (f.minPrice !== null ||
+          f.maxPrice !== null ||
+          f.skuContains ||
+          f.titleContains ||
+          f.stock !== "any" ||
+          !(f.statuses.length === 1 && f.statuses[0] === "ACTIVE")),
+    ),
+  );
+  const [manualFilterValue, setManualFilterValue] = useState(
+    t?.manualVariantIds.length ? JSON.stringify(t.manualVariantIds) : "",
+  );
+  const [mode, setMode] = useState(t?.mode ?? "percent");
+  const [targetField, setTargetField] = useState(t?.targetField ?? "price");
+  const [value, setValue] = useState(t?.value ?? "");
+  const [rounding, setRounding] = useState<Rounding>(t?.rounding ?? "none");
+  const [minPrice, setMinPrice] = useState(t?.minPrice ?? "");
+  const [maxDiscountPercent, setMaxDiscountPercent] = useState(t?.maxDiscountPercent ?? "");
   const [runAt, setRunAt] = useState("");
   const [revertAt, setRevertAt] = useState("");
-  const [skipExistingCompareAt, setSkipExistingCompareAt] = useState(false);
-  const [autoApplyNewProducts, setAutoApplyNewProducts] = useState(false);
+  const [skipExistingCompareAt, setSkipExistingCompareAt] = useState(
+    t?.skipExistingCompareAt ?? false,
+  );
+  const [autoApplyNewProducts, setAutoApplyNewProducts] = useState(
+    t?.autoApplyNewProducts ?? false,
+  );
+  const [saleTag, setSaleTag] = useState(t?.saleTag ?? "");
 
   const isLoading = fetcher.state !== "idle";
   const isPreview = fetcher.data?.intent === "preview";
@@ -301,6 +428,7 @@ export default function NewJob() {
   const skippedCount = isPreview ? fetcher.data?.skippedCount ?? 0 : 0;
   const marketChanges = isPreview ? fetcher.data?.marketChanges ?? {} : {};
   const marketChangeCount = isPreview ? fetcher.data?.marketChangeCount ?? 0 : 0;
+  const overlaps = isPreview ? fetcher.data?.overlaps ?? [] : [];
   const previewError = fetcher.data?.error;
   const createdJobId = fetcher.data?.intent === "create" ? fetcher.data.jobId : undefined;
 
@@ -412,6 +540,7 @@ export default function NewJob() {
         revertAt: localToIso(revertAt),
         skipExistingCompareAt: String(skipExistingCompareAt),
         autoApplyNewProducts: String(autoApplyNewProducts),
+        saleTag,
         rounding,
         minPrice,
         maxDiscountPercent,
@@ -434,6 +563,19 @@ export default function NewJob() {
     <Page>
       <TitleBar title="New price change" />
       <BlockStack gap="400">
+        {t && (
+          <Banner tone="info">
+            Settings copied from "{t.sourceName}". Check them, set new dates, and preview
+            before applying.
+          </Banner>
+        )}
+        {t?.legacyAllValues && (
+          <Banner tone="warning" title="Product matching works differently in the copy">
+            The original used the old "match ALL" rule, so a product needed every listed
+            tag/vendor/type. Now "match ALL" means any value within each field, so this copy
+            can match more products. Preview and check the count before applying.
+          </Banner>
+        )}
         <Card>
           <FormLayout>
             <TextField
@@ -724,6 +866,14 @@ export default function NewJob() {
                 onChange={setAutoApplyNewProducts}
               />
             )}
+            <TextField
+              label="Tag products while on sale (optional)"
+              placeholder="e.g. black-month-sale"
+              value={saleTag}
+              onChange={setSaleTag}
+              autoComplete="off"
+              helpText="Added to every product this change applies to and removed again on revert. Use it for an automated Sale collection, banners or email segments."
+            />
 
             <InlineGrid columns={{ xs: 1, md: 2 }} gap="300">
               <TextField
@@ -771,6 +921,26 @@ export default function NewJob() {
               <Text as="h2" variant="headingMd">
                 Preview ({preview.length} variant{preview.length === 1 ? "" : "s"})
               </Text>
+              {overlaps.length > 0 && (
+                <Banner tone="warning" title="Some of these variants are in other price changes">
+                  <BlockStack gap="100">
+                    {overlaps.map((o) => (
+                      <Text as="p" key={o.jobId}>
+                        <Link url={`/app/jobs/${o.jobId}`}>{o.name || "Unnamed price change"}</Link>{" "}
+                        ({o.status}
+                        {o.revertAt ? `, reverts ${new Date(o.revertAt).toLocaleString()}` : ""}):{" "}
+                        {o.variantCount} variant{o.variantCount === 1 ? "" : "s"}
+                      </Text>
+                    ))}
+                    <Text as="p" tone="subdued">
+                      This change builds on their prices. When ending them, revert the newest
+                      first: a job only puts back prices that are still what it set, so
+                      reverting an older one first leaves these variants alone (you can then
+                      force them back from its page).
+                    </Text>
+                  </BlockStack>
+                </Banner>
+              )}
               {previewStats && (
                 <Text as="p" tone="subdued">
                   {previewStats.changed} will change
